@@ -141,6 +141,20 @@ func lastAssistantIndex(msgs []chatMessage) int {
 	return idx
 }
 
+// isAgentMode reports whether the request is an agent/tool request: either the
+// history already carries a tool loop, or active tools are declared. Agent
+// requests must never be attached to a recent-session fallback (strategy 3),
+// since a miss should become a fresh session with a lossless replay.
+func isAgentMode(req *chatRequest) bool {
+	if hasToolFlow(req.Messages) {
+		return true
+	}
+	if len(parseTools(req.Tools)) == 0 {
+		return false
+	}
+	return parseToolChoice(req.ToolChoice).kind != "none"
+}
+
 // ---- sentinel constants ----
 
 const (
@@ -318,9 +332,71 @@ func knownToolNames(tools []toolDef) map[string]bool {
 	return known
 }
 
+// findTool locates the declared tool for a (fuzzy) name.
+func findTool(tools []toolDef, name string) *toolDef {
+	if !matchToolName(name, knownToolNames(tools)) {
+		return nil
+	}
+	for i := range tools {
+		if tools[i].Function.Name == name || normToolName(tools[i].Function.Name) == normToolName(name) {
+			return &tools[i]
+		}
+	}
+	return nil
+}
+
+// toolProperties extracts the JSON-schema property keys of one tool.
+func toolProperties(t *toolDef) map[string]any {
+	if t == nil || len(t.Function.Parameters) == 0 {
+		return nil
+	}
+	var p struct {
+		Properties map[string]any `json:"properties"`
+	}
+	if json.Unmarshal(t.Function.Parameters, &p) == nil {
+		return p.Properties
+	}
+	return nil
+}
+
+// fixArgNames corrects argument key names to the schema's parameter names.
+// Small models often deviate (path vs filePath): a wrong key is renamed only
+// when a case-insensitive substring match against the schema properties is
+// unique; ambiguous or unknown keys are kept as-is.
+func fixArgNames(args map[string]any, properties map[string]any) map[string]any {
+	if len(args) == 0 || len(properties) == 0 {
+		return args
+	}
+	lower := make(map[string]string, len(properties))
+	for k := range properties {
+		lower[strings.ToLower(k)] = k
+	}
+	out := make(map[string]any, len(args))
+	for k, v := range args {
+		if _, ok := properties[k]; ok {
+			out[k] = v
+			continue
+		}
+		missed := strings.ToLower(k)
+		var hits []string
+		for lk, orig := range lower {
+			if strings.Contains(lk, missed) {
+				hits = append(hits, orig)
+			}
+		}
+		if len(hits) == 1 {
+			out[hits[0]] = v
+		} else {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // normalizeToolCall validates a call against the declared tool set. With a
 // non-empty tool set, unknown names are dropped (strict mode) to keep model
-// hallucinations out of the agent loop.
+// hallucinations out of the agent loop. Argument key names are corrected
+// against the schema when the model deviates (see fixArgNames).
 func normalizeToolCall(id, name string, args any, tools []toolDef) *ToolCall {
 	if name == "" {
 		return nil
@@ -328,6 +404,9 @@ func normalizeToolCall(id, name string, args any, tools []toolDef) *ToolCall {
 	if len(tools) > 0 && !matchToolName(name, knownToolNames(tools)) {
 		log.Printf("tools: dropping unknown tool name %q", name)
 		return nil
+	}
+	if m, ok := args.(map[string]any); ok {
+		args = fixArgNames(m, toolProperties(findTool(tools, name)))
 	}
 	call := ToolCall{ID: id, Name: name, Arguments: coerceArguments(args)}
 	if call.ID == "" {
@@ -345,14 +424,59 @@ func coerceArguments(args any) string {
 		if s == "" {
 			return "{}"
 		}
-		var check any
-		if json.Unmarshal([]byte(s), &check) == nil {
+		if looseJSON(s) != nil {
 			return s
 		}
 		return mustMarshalString(map[string]any{"value": v})
 	default:
 		return mustMarshalString(v)
 	}
+}
+
+// trailingCommaRE strips trailing commas that models add before } / ].
+var trailingCommaRE = regexp.MustCompile(`,\s*([}\]])`)
+
+// fixFullWidth turns full-width punctuation models leak into JSON into ASCII.
+func fixFullWidth(s string) string {
+	s = strings.ReplaceAll(s, "，", ",")
+	s = strings.ReplaceAll(s, "：", ":")
+	return s
+}
+
+// looseJSON is a tolerant JSON parse: code fences, a leading "json" fence
+// label, trailing commas and full-width punctuation are repaired before
+// giving up. Returns nil when the input is not (repairable) JSON.
+func looseJSON(raw string) any {
+	raw = strings.TrimSpace(raw)
+	raw = strings.Trim(raw, "`")
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "json") {
+		raw = strings.TrimSpace(raw[len("json"):])
+	}
+	if raw == "" {
+		return nil
+	}
+	var v any
+	if json.Unmarshal([]byte(raw), &v) == nil {
+		return v
+	}
+	s, e := strings.Index(raw, "{"), strings.LastIndex(raw, "}")
+	if s < 0 || e <= s {
+		return nil
+	}
+	frag := raw[s : e+1]
+	candidates := []string{
+		frag,
+		trailingCommaRE.ReplaceAllString(frag, "$1"),
+		fixFullWidth(frag),
+		trailingCommaRE.ReplaceAllString(fixFullWidth(frag), "$1"),
+	}
+	for _, c := range candidates {
+		if json.Unmarshal([]byte(c), &v) == nil {
+			return v
+		}
+	}
+	return nil
 }
 
 func mustMarshalString(v any) string {
@@ -397,8 +521,7 @@ func decodeDSMLValue(raw string, isString bool) any {
 	if s == "" {
 		return ""
 	}
-	var v any
-	if json.Unmarshal([]byte(s), &v) == nil {
+	if v := looseJSON(s); v != nil {
 		return v
 	}
 	return raw
@@ -498,31 +621,72 @@ func parseSentinelBody(body string, tools []toolDef) []ToolCall {
 		if line == "" || strings.HasPrefix(line, "//") {
 			continue
 		}
-		var data struct {
-			ID        string `json:"id"`
-			Name      string `json:"name"`
-			Arguments any    `json:"arguments"`
-			Function  struct {
-				Name      string `json:"name"`
-				Arguments any    `json:"arguments"`
-			} `json:"function"`
-		}
-		if json.Unmarshal([]byte(line), &data) != nil {
+		data := looseJSON(line)
+		m, ok := data.(map[string]any)
+		if !ok {
 			continue
 		}
-		name := data.Name
-		if name == "" {
-			name = data.Function.Name
-		}
-		args := data.Arguments
-		if args == nil {
-			args = data.Function.Arguments
-		}
-		if call := normalizeToolCall(data.ID, name, args, tools); call != nil {
+		if call := normalizeSentinelData(m, tools); call != nil {
 			calls = append(calls, *call)
 		}
 	}
 	return calls
+}
+
+// normalizeSentinelData turns one {"id","name"/"function","arguments"} object
+// into a validated ToolCall (loose JSON in, spec JSON string out).
+func normalizeSentinelData(data map[string]any, tools []toolDef) *ToolCall {
+	id, _ := data["id"].(string)
+	name, _ := data["name"].(string)
+	if name == "" {
+		if fn, ok := data["function"].(map[string]any); ok {
+			name, _ = fn["name"].(string)
+		}
+	}
+	args := data["arguments"]
+	if args == nil {
+		if fn, ok := data["function"].(map[string]any); ok {
+			args = fn["arguments"]
+		}
+	}
+	return normalizeToolCall(id, name, args, tools)
+}
+
+// parseJSONCalls accepts the JSON shapes a call blob may take: a
+// {"tool_calls":[...]} wrapper, a single call object, or a bare list.
+func parseJSONCalls(raw string, tools []toolDef) []ToolCall {
+	data := looseJSON(raw)
+	if data == nil {
+		return nil
+	}
+	switch v := data.(type) {
+	case map[string]any:
+		if tcs, ok := v["tool_calls"].([]any); ok {
+			var calls []ToolCall
+			for _, x := range tcs {
+				if m, ok := x.(map[string]any); ok {
+					if c := normalizeSentinelData(m, tools); c != nil {
+						calls = append(calls, *c)
+					}
+				}
+			}
+			return calls
+		}
+		if c := normalizeSentinelData(v, tools); c != nil {
+			return []ToolCall{*c}
+		}
+	case []any:
+		var calls []ToolCall
+		for _, x := range v {
+			if m, ok := x.(map[string]any); ok {
+				if c := normalizeSentinelData(m, tools); c != nil {
+					calls = append(calls, *c)
+				}
+			}
+		}
+		return calls
+	}
+	return nil
 }
 
 // ---- whole-text parsing (non-streaming) ----
@@ -619,9 +783,11 @@ func trySentinel(text string, tools []toolDef) ([]ToolCall, string) {
 }
 
 // parseToolCalls extracts tool calls from a completed reply. Priority:
-// DSML, then sentinel. Marker-less JSON is intentionally NOT sniffed:
-// ordinary JSON in answers and code samples must not become tool calls.
-func parseToolCalls(text string, tools []toolDef) (calls []ToolCall, cleanText string) {
+// DSML, then sentinel. Marker-less bare JSON is only sniffed when
+// jsonFallback is enabled (opt-in), with a double criterion so ordinary
+// JSON in answers and code samples stays text: the name key must hit the
+// declared whitelist AND the object must carry an arguments/args key.
+func parseToolCalls(text string, tools []toolDef, jsonFallback bool) (calls []ToolCall, cleanText string) {
 	if text == "" {
 		return nil, text
 	}
@@ -631,5 +797,100 @@ func parseToolCalls(text string, tools []toolDef) (calls []ToolCall, cleanText s
 	if c, clean := trySentinel(text, tools); c != nil {
 		return c, clean
 	}
+	if jsonFallback && len(tools) > 0 {
+		allowed := knownToolNames(tools)
+		blobs := bareJSONBlobs(text, allowed)
+		if len(blobs) > 0 {
+			for _, blob := range blobs {
+				if c := parseJSONCalls(blob, tools); c != nil {
+					calls = append(calls, c...)
+				}
+			}
+			if len(calls) > 0 {
+				clean := text
+				for _, blob := range blobs {
+					clean = strings.Replace(clean, blob, " ", 1)
+				}
+				return calls, strings.TrimSpace(clean)
+			}
+		}
+	}
 	return nil, text
+}
+
+// bareJSONBlobs scans the whole text for JSON objects that look like tool
+// calls: a name (or tool) key in the declared whitelist AND an
+// arguments/args key. Both criteria are required so code samples and echoed
+// tool definitions are never mistaken for calls.
+func bareJSONBlobs(text string, allowed map[string]bool) []string {
+	var out []string
+	i := 0
+	for i < len(text) {
+		if text[i] != '{' {
+			i++
+			continue
+		}
+		blob := scanJSONBlob(text, i)
+		if blob == "" {
+			break
+		}
+		if obj, ok := looseJSON(blob).(map[string]any); ok {
+			name, _ := obj["name"].(string)
+			if name == "" {
+				name, _ = obj["tool"].(string)
+			}
+			if name != "" && allowed[name] && (hasKey(obj, "arguments") || hasKey(obj, "args")) {
+				out = append(out, blob)
+				i += len(blob)
+				continue
+			}
+		}
+		i++
+	}
+	return out
+}
+
+func hasKey(m map[string]any, k string) bool {
+	_, ok := m[k]
+	return ok
+}
+
+// scanJSONBlob finds the first '{' at/after start and returns the
+// brace-balanced object, keeping string-literal braces out of the count.
+// When the stream is cut short it returns what was seen, for looseJSON to
+// repair.
+func scanJSONBlob(text string, start int) string {
+	s := strings.Index(text[start:], "{")
+	if s < 0 {
+		return ""
+	}
+	s += start
+	depth := 0
+	inStr, esc := false, false
+	for i := s; i < len(text); i++ {
+		ch := text[i]
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case ch == '\\':
+				esc = true
+			case ch == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return text[s : i+1]
+			}
+		}
+	}
+	return text[s:]
 }

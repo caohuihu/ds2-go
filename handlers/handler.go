@@ -453,7 +453,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	// The marker detector runs on every reply stream: in tool mode it extracts
 	// calls; without tools it still strips any DSML / sentinel fragments the
 	// model may leak so artifacts never reach the client.
-	detector := newStreamingToolDetector(tools, !activeTools)
+	detector := newStreamingToolDetector(tools, !activeTools, h.cfg.ToolJSONFallback)
 	var emittedCalls []ToolCall
 
 	routeDeltas := func(kind deepseek.DeltaKind, text string) {
@@ -537,7 +537,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	// streaming detector already flushed its residue at the end of the stream.
 	var cleanText string
 	if !req.Stream {
-		calls, clean := parseToolCalls(reply.String(), tools)
+		calls, clean := parseToolCalls(reply.String(), tools, h.cfg.ToolJSONFallback)
 		emittedCalls = calls
 		cleanText = clean
 	} else {
@@ -551,6 +551,19 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 				emittedCalls = append(emittedCalls, act.calls...)
 				stream.toolCalls(act.calls)
 			}
+		}
+	}
+
+	// Reasoning fallback: web models sometimes write the final answer only
+	// into the THINK fragment, leaving the body empty (the client would get
+	// a blank reply). Promote the thinking text to content — skipped when
+	// the turn ended in tool calls, where empty content is the normal shape.
+	reasoningSwapped, promoted := shouldPromoteReasoning(reply.String(), thinking.String(), h.cfg.ReasoningFallback, len(emittedCalls) > 0)
+	if reasoningSwapped {
+		if !req.Stream {
+			cleanText = promoted
+		} else {
+			stream.delta(deepseek.DeltaReply, promoted)
 		}
 	}
 
@@ -602,7 +615,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	} else {
 		message["content"] = cleanText
 	}
-	if t := thinking.String(); t != "" {
+	if t := thinking.String(); t != "" && !reasoningSwapped {
 		message["reasoning_content"] = t
 	}
 	resp := map[string]any{
@@ -680,13 +693,18 @@ func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool) (*
 	}
 
 	// Strategy 3: fallback — reuse the most recently used session for this model.
-	// Same eviction logic: occasionally drop the cached session so concurrent
-	// requests don't all fight over the same one.
-	if c := h.convs.RecentForModel(m.ID); c != nil {
-		log.Printf("chat: strategy3 hit session=%s turns=%d", c.SessionID[:8], c.Turn)
-		evict(c)
-		if h.convs.BySession(c.SessionID) == c {
-			return c, false, nil
+	// Disabled for agent/tool requests (a prefix miss must become a fresh
+	// session with a lossless history replay; a recent-session hit would
+	// silently cross-contaminate another conversation's context) and by
+	// SESSION_RECENT_FALLBACK=false for everyone.
+	agentMode := isAgentMode(req)
+	if !agentMode && h.cfg.SessionRecentFallback {
+		if c := h.convs.RecentForModel(m.ID); c != nil {
+			log.Printf("chat: strategy3 hit session=%s turns=%d", c.SessionID[:8], c.Turn)
+			evict(c)
+			if h.convs.BySession(c.SessionID) == c {
+				return c, false, nil
+			}
 		}
 	}
 	// Coalesce concurrent requests with the same prefix: instead of each
@@ -920,6 +938,21 @@ func randHex(n int) string {
 func mustJSON(s string) []byte {
 	b, _ := json.Marshal(s)
 	return b
+}
+
+// shouldPromoteReasoning decides whether the thinking block must stand in
+// for an empty reply body. It fires only when the body is blank, the
+// thinking is not, no tool calls were emitted (empty content is the normal
+// tool-call shape), and the feature is enabled. Returns whether to promote
+// and the promoted text.
+func shouldPromoteReasoning(reply, thinking string, enabled, hasCalls bool) (bool, string) {
+	if !enabled || hasCalls {
+		return false, ""
+	}
+	if strings.TrimSpace(reply) == "" && strings.TrimSpace(thinking) != "" {
+		return true, strings.TrimSpace(thinking)
+	}
+	return false, ""
 }
 
 // recordRequestTime updates the last-request timestamp for this client

@@ -118,4 +118,15 @@ DeepSeek 网页 token 会静默失效，此前只能在实际请求中途才发�
 
 > 使用：`tail -f` 检测日志（默认与主日志同目录，如 `logs/deepseek-health.log`），看 `[summary]` 行与 `EXPIRED … quarantined` 行即可定位 `accounts.txt` 里哪一行 token 需要重新抓取替换。
 
+### Agent 加固（会话防串台 + 工具解析 + 思考兜底）
+
+对齐 webai2api v0.1.20-v0.1.32 的四项加固（`handlers/tools.go`、`handlers/tools_stream.go`、`handlers/handler.go`）：
+
+- **Strategy-3 门控**（`SESSION_RECENT_FALLBACK`，默认开）：agent 请求（带 tools 或工具历史）禁用最近会话兜底——前缀未命中时一律新建会话并全量重放历史（无损），两个不同会话不再互相借用上下文（根治「新开会话却记得上一个会话」）。
+- **参数名模糊校正**：模型把参数名写错（schema 要 `filePath` 它给 `path`）时，按大小写不敏感唯一子串命中自动改名；歧义或无命中保持原样不瞎猜。
+- **宽松 JSON 修复**：模型输出的 JSON 带代码围栏 / 尾逗号 / 全角标点（，：）时，解析前自动修复（哨兵行与 DSML 值解码均生效）。
+- **裸 JSON 兜底**（`TOOL_JSON_FALLBACK`，默认关）：无标记的调用 JSON 双判据嗅探（工具名在声明清单 且 带 arguments/args 键），防止把回答里的普通 JSON / 代码示例误判成工具调用；流式检测器同步加 JSON 状态。
+- **空正文兜底**（`REASONING_FALLBACK`，默认开）：正文为空而思考块非空时（网页模型把答案写进 THINK 块），非流式直接置换、流式结尾补发 content 增量，客户端不再收到空回复；工具调用轮次不受影响（空正文是正常形态）。
+
+
 
