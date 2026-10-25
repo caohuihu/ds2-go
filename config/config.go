@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -71,7 +72,7 @@ func Load() (*Config, error) {
 		LogFile:                   env("LOG_FILE", ""),
 		HealthProbeInterval:       parseDurationEnv("HEALTH_PROBE_INTERVAL", 30*time.Minute),
 		HealthProbeDeadRetry:      parseDurationEnv("HEALTH_PROBE_DEAD_RETRY", 10*time.Minute),
-		HealthLogFile:             env("HEALTH_LOG_FILE", "deepseek-health.log"),
+		HealthLogFile:             env("HEALTH_LOG_FILE", ""),
 		StartupAccountCheck:       parseBoolEnv("STARTUP_ACCOUNT_CHECK", true),
 	}
 	if cfg.ProxyAPIKey == "" {
@@ -100,6 +101,17 @@ func Load() (*Config, error) {
 	cfg.Accounts = append(cfg.Accounts, fileAccounts...)
 	if len(cfg.Accounts) == 0 {
 		return nil, fmt.Errorf("no DeepSeek account configured; set DEEPSEEK_TOKEN or %s", cfg.AccountsFile)
+	}
+
+	// Place the token-health log next to the main log file when the user did
+	// not choose an explicit location: one folder to tail, in both bare
+	// deployments and Docker (where LOG_FILE=/app/logs/app.log is mounted).
+	if cfg.HealthLogFile == "" {
+		if cfg.LogFile != "" {
+			cfg.HealthLogFile = filepath.Join(filepath.Dir(cfg.LogFile), "deepseek-health.log")
+		} else {
+			cfg.HealthLogFile = "deepseek-health.log"
+		}
 	}
 	return cfg, nil
 }

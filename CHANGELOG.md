@@ -45,7 +45,8 @@ All notable changes to this project will be documented in this file.
   - `response_format: {"type":"json_object"}` injects a JSON-only directive.
 
 - **Account token-expiry detection** (`handlers/health.go`)
-  - A dedicated detection log file (`HEALTH_LOG_FILE`, default `deepseek-health.log`) records
+  - A dedicated detection log file (`HEALTH_LOG_FILE`, defaults to the main log's directory,
+    e.g. `/app/logs/deepseek-health.log`) records
     quarantines, revivals and a running one-line summary; tokens are only ever printed masked
     (`ab12cd…ef90`).
   - **Startup check** (`STARTUP_ACCOUNT_CHECK`, default on): every account is probed before the

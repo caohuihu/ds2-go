@@ -143,7 +143,7 @@ PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' docker compose u
 | `STARTUP_ACCOUNT_CHECK` | `true` | 启动时对全部账号做一次轻量鉴权探测，失效账号自动隔离 |
 | `HEALTH_PROBE_INTERVAL` | `30m` | 周期探测所有存活账号的间隔（0=关闭） |
 | `HEALTH_PROBE_DEAD_RETRY` | `10m` | 对被隔离账号的重试间隔（token 换新后自动复活） |
-| `HEALTH_LOG_FILE` | `deepseek-health.log` | 检测日志文件：隔离/复活/摘要事件，token 只显示掩码 |
+| `HEALTH_LOG_FILE` | 同 `LOG_FILE` 目录 | 检测日志文件：隔离/复活/摘要事件，token 只显示掩码；留空默认与主日志同目录 |
 
 ## 多轮对话
 
@@ -171,14 +171,14 @@ DeepSeek 网页 token 会静默失效。本代理主动检测，而不是等到�
 - **启动校验**：服务启动、开始监听前，对每个账号做一次无副作用的鉴权探测（PoW-challenge 拉取）。失效账号当场隔离。
 - **周期探测**：每 `HEALTH_PROBE_INTERVAL`（默认 30m）重探全部存活账号；被隔离账号每 `HEALTH_PROBE_DEAD_RETRY`（默认 10m）重试一次，token 换新后无需重启即自动复活。
 - **使用中被动隔离**：真实补全请求里一旦看到 401/403，立刻隔离该账号；绑定在它上面的会话会被迁移到存活账号并全量重放历史；若所有账号都失效，请求快速失败并返回清晰的 503。
-- **检测日志**：每次隔离/复活以及一条滚动摘要都追加到 `HEALTH_LOG_FILE`（默认 `deepseek-health.log`）。token 一律只打印掩码（`ab12cd…ef90`），文件可安全保留：
+- **检测日志**：每次隔离/复活以及一条滚动摘要都追加到 `HEALTH_LOG_FILE`。留空时默认与主日志同目录（`LOG_FILE=/app/logs/app.log` → `/app/logs/deepseek-health.log`），一个文件夹里 `tail -f` 两个文件即可。token 一律只打印掩码（`ab12cd…ef90`），文件可安全保留：
 
   ```
   2026-10-25T01:00:03+08:00 [probe] #1/5 ab12cd…ef90 EXPIRED (upstream http 401) → quarantined
   2026-10-25T01:00:03+08:00 [summary] total=5 live=4 quarantined=1 [#1 upstream http 401]
   ```
 
-  `tail -f deepseek-health.log` 即可知道要替换 `accounts.txt` 的哪一行。
+  直接 `tail -f` 该文件（与主日志同目录）即可知道要替换 `accounts.txt` 的哪一行。
 
 ## 认证方式
 

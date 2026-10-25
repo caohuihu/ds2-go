@@ -104,7 +104,7 @@ DeepSeek 网页 token 会静默失效，此前只能在实际请求中途才发�
 
 - **新增文件** `handlers/health.go`：
   - `AccountPool` 增加隔离状态机（`dead` map，`IsDead`/`Quarantine`/`Revive`/`NextLive`/`HasLive`）；`NextLive` 轮询时跳过被隔离账号。
-  - `HealthChecker`：用无副作用的鉴权请求（PoW-challenge 拉取）探测账号存活；事件追加写入 `HEALTH_LOG_FILE`（默认 `deepseek-health.log`），token 一律只打掩码（`ab12cd…ef90`）。
+  - `HealthChecker`：用无副作用的鉴权请求（PoW-challenge 拉取）探测账号存活；事件追加写入 `HEALTH_LOG_FILE`（留空默认与主日志同目录，如 `/app/logs/deepseek-health.log`），token 一律只打掩码（`ab12cd…ef90`）。
   - 启动校验（`STARTUP_ACCOUNT_CHECK`，默认开）：监听前探测全部账号，失效的当场隔离。
   - 周期探测：存活账号每 `HEALTH_PROBE_INTERVAL`（默认 30m），被隔离账号每 `HEALTH_PROBE_DEAD_RETRY`（默认 10m）重试，token 换新后免重启自动复活。
 - **`handlers/handler.go`**：
@@ -116,6 +116,6 @@ DeepSeek 网页 token 会静默失效，此前只能在实际请求中途才发�
 - **`main.go`**：接线 HealthChecker、启动探测、启动日志输出。
 - **文档**：`.env.example` 增加账号健康检测配置块；README（中/英）增加「账号健康检测」章节与配置表行。
 
-> 使用：`tail -f deepseek-health.log`，看 `[summary]` 行与 `EXPIRED … quarantined` 行即可定位 `accounts.txt` 里哪一行 token 需要重新抓取替换。
+> 使用：`tail -f` 检测日志（默认与主日志同目录，如 `logs/deepseek-health.log`），看 `[summary]` 行与 `EXPIRED … quarantined` 行即可定位 `accounts.txt` 里哪一行 token 需要重新抓取替换。
 
 

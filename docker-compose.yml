@@ -35,6 +35,8 @@ services:
       # 推荐值：5~10 → 约每 5-10 条消息开一个新会话，可实现 3-5 个会话持续运行
       # 日志文件路径（容器内），挂载到宿主机可查看历史日志
       - LOG_FILE=${LOG_FILE:-}
+      # 检测日志文件（可选，留空默认与 LOG_FILE 同目录：/app/logs/deepseek-health.log）
+      - HEALTH_LOG_FILE=${HEALTH_LOG_FILE:-}
     volumes:
       - ./accounts.txt:/app/accounts.txt:ro
       # 日志文件（可选，设置 LOG_FILE 后生效）

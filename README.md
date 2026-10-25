@@ -164,7 +164,7 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | `STARTUP_ACCOUNT_CHECK` | `true` | 启动时对全部账号做一次轻量鉴权探测，失效账号自动隔离 |
 | `HEALTH_PROBE_INTERVAL` | `30m` | 周期探测所有存活账号的间隔（0=关闭） |
 | `HEALTH_PROBE_DEAD_RETRY` | `10m` | 对被隔离账号的重试间隔（token 换新后自动复活） |
-| `HEALTH_LOG_FILE` | `deepseek-health.log` | 检测日志文件：隔离/复活/摘要事件，token 只显示掩码 |
+| `HEALTH_LOG_FILE` | 同 `LOG_FILE` 目录 | 检测日志文件：隔离/复活/摘要事件，token 只显示掩码；留空默认与主日志同目录（如 `/app/logs/deepseek-health.log`） |
 
 ## Multi-turn conversations
 
@@ -226,15 +226,17 @@ finding out mid-request:
   migrated to a live account with a full history replay; if *all* accounts
   are dead, requests fail fast with a clear 503.
 - **Detection log** — every quarantine/revival and a running summary are
-  appended to `HEALTH_LOG_FILE` (default `deepseek-health.log`). Tokens are
-  only ever printed masked (`ab12cd…ef90`), so the file is safe to keep:
+  appended to `HEALTH_LOG_FILE`. Left empty, it defaults to the main log's
+  folder (`LOG_FILE=/app/logs/app.log` → `/app/logs/deepseek-health.log`), so
+  both live side by side. Tokens are only ever printed masked
+  (`ab12cd…ef90`), so the file is safe to keep:
 
   ```
   2026-10-25T01:00:03+08:00 [probe] #1/5 ab12cd…ef90 EXPIRED (upstream http 401) → quarantined
   2026-10-25T01:00:03+08:00 [summary] total=5 live=4 quarantined=1 [#1 upstream http 401]
   ```
 
-  `tail -f deepseek-health.log` tells you exactly which line of
+  `tail -f` that file (next to your main log) tells you exactly which line of
   `accounts.txt` to replace.
 
 ## Authentication
