@@ -165,6 +165,8 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | `HEALTH_PROBE_INTERVAL` | `30m` | 周期探测所有存活账号的间隔（0=关闭） |
 | `HEALTH_PROBE_DEAD_RETRY` | `10m` | 对被隔离账号的重试间隔（token 换新后自动复活） |
 | `HEALTH_LOG_FILE` | 同 `LOG_FILE` 目录 | 检测日志文件：隔离/复活/摘要事件，token 只显示掩码；留空默认与主日志同目录（如 `/app/logs/deepseek-health.log`） |
+| `TOOL_JSON_FALLBACK` | `false` | Sniff unmarked bare JSON as tool calls (double criterion: name in whitelist AND has arguments); opt-in |
+| `REASONING_FALLBACK` | `true` | Promote thinking text to content when the reply body is empty |
 
 ## Multi-turn conversations
 
@@ -205,6 +207,11 @@ simulates it at the text layer (the same approach webai2api uses):
   `{"type":"function","function":{"name":"..."}}`.
 - Unknown tool names emitted by the model are dropped (strict mode), not
   forwarded to the agent.
+- Argument keys the model gets wrong are corrected against the schema when a
+  case-insensitive substring match is unique (`path` → `filePath`); sloppy
+  JSON (fences, trailing commas, full-width punctuation) is repaired before
+  parsing. Bare-JSON calls without markers can be sniffed with
+  `TOOL_JSON_FALLBACK=true` (double criterion: declared name AND arguments).
 - Agent tool loops are exempted from the random session-reset chance and the
   read-time cooldown is capped at 2s so the loop stays responsive.
 - `response_format: {"type":"json_object"}` injects a "JSON only" directive.
@@ -257,6 +264,9 @@ exposed to callers.
   upstream session. Vision requests add a few seconds of first-token latency.
 - **Usage** is estimated: totals come from the upstream session's cumulative
   token delta, and the split is approximated by character count.
+- **Reasoning fallback**: when the model writes the final answer only into the
+  thinking block (empty body), the thinking text is promoted to `content` so
+  the client never gets a blank reply (`REASONING_FALLBACK`, default on).
 - Upstream `429` maps to `429`; an invalid token maps to `401`.
 - Do **not** commit your tokens. `accounts.txt` is already in `.gitignore`.
 

@@ -13,7 +13,7 @@ var testTools = []toolDef{
 
 func TestParseToolCallsDSMLFull(t *testing.T) {
 	text := "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"get_weather\">\n<｜｜DSML｜｜ parameter name=\"city\" string=\"true\">Beijing</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>"
-	calls, clean := parseToolCalls(text, testTools)
+	calls, clean := parseToolCalls(text, testTools, false)
 	if len(calls) != 1 {
 		t.Fatalf("want 1 call, got %d", len(calls))
 	}
@@ -34,7 +34,7 @@ func TestParseToolCallsDSMLFull(t *testing.T) {
 
 func TestParseToolCallsMultipleInvokes(t *testing.T) {
 	text := "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"bash\">\n<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">ls -la</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n<｜｜DSML｜｜ invoke name=\"get_weather\">\n<｜｜DSML｜｜ parameter name=\"city\" string=\"true\">Shanghai</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ calls>"
-	calls, _ := parseToolCalls(text, testTools)
+	calls, _ := parseToolCalls(text, testTools, false)
 	if len(calls) != 2 {
 		t.Fatalf("want 2 calls, got %d", len(calls))
 	}
@@ -45,7 +45,7 @@ func TestParseToolCallsMultipleInvokes(t *testing.T) {
 
 func TestParseToolCallsHalfWidthPipes(t *testing.T) {
 	text := "<||DSML|| calls>\n<||DSML|| invoke name=\"bash\">\n<||DSML|| parameter name=\"command\" string=\"true\">echo hi</||DSML|| parameter>\n</||DSML|| invoke>\n</||DSML|| calls>"
-	calls, _ := parseToolCalls(text, testTools)
+	calls, _ := parseToolCalls(text, testTools, false)
 	if len(calls) != 1 || calls[0].Name != "bash" {
 		t.Fatalf("half-width pipes not parsed: %v", calls)
 	}
@@ -61,7 +61,7 @@ func TestParseToolCallsHalfWidthPipes(t *testing.T) {
 func TestParseToolCallsClosedInvokesMissing(t *testing.T) {
 	// no </invoke>, no </calls> — implicit split + finalize at end of text
 	text := "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"get_weather\">\n<｜｜DSML｜｜ parameter name=\"city\" string=\"true\">Beijing"
-	calls, _ := parseToolCalls(text, testTools)
+	calls, _ := parseToolCalls(text, testTools, false)
 	if len(calls) != 1 || calls[0].Name != "get_weather" {
 		t.Fatalf("unterminated block not recovered: %v", calls)
 	}
@@ -69,7 +69,7 @@ func TestParseToolCallsClosedInvokesMissing(t *testing.T) {
 
 func TestParseToolCallsBareInvoke(t *testing.T) {
 	text := "done\n<｜｜DSML｜｜ invoke name=\"bash\">\n<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">pwd</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\nafter"
-	calls, clean := parseToolCalls(text, testTools)
+	calls, clean := parseToolCalls(text, testTools, false)
 	if len(calls) != 1 || calls[0].Name != "bash" {
 		t.Fatalf("bare invoke not parsed: %v", calls)
 	}
@@ -80,7 +80,7 @@ func TestParseToolCallsBareInvoke(t *testing.T) {
 
 func TestParseToolCallsSentinel(t *testing.T) {
 	text := "<|tool_calls|>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Beijing\"}}\n<|/tool_calls|>"
-	calls, clean := parseToolCalls(text, testTools)
+	calls, clean := parseToolCalls(text, testTools, false)
 	if len(calls) != 1 || calls[0].Name != "get_weather" {
 		t.Fatalf("sentinel not parsed: %v", calls)
 	}
@@ -91,12 +91,12 @@ func TestParseToolCallsSentinel(t *testing.T) {
 
 func TestParseToolCallsStrictNames(t *testing.T) {
 	text := "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"hack_the_planet\">\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>"
-	calls, clean := parseToolCalls(text, testTools)
+	calls, clean := parseToolCalls(text, testTools, false)
 	if len(calls) != 0 {
 		t.Fatalf("unknown tool name not dropped: %v", calls)
 	}
 	// without declared tools the same block passes (lenient)
-	calls2, _ := parseToolCalls(text, nil)
+	calls2, _ := parseToolCalls(text, nil, false)
 	if len(calls2) != 1 {
 		t.Fatalf("lenient mode should accept unknown name: %v", calls2)
 	}
@@ -105,7 +105,7 @@ func TestParseToolCallsStrictNames(t *testing.T) {
 
 func TestParseToolCallsNoMarker(t *testing.T) {
 	text := "Here is some JSON:\n```json\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"X\"}}\n```\n"
-	calls, clean := parseToolCalls(text, testTools)
+	calls, clean := parseToolCalls(text, testTools, false)
 	if len(calls) != 0 {
 		t.Fatalf("marker-less JSON must not become tool calls: %v", calls)
 	}
@@ -116,7 +116,7 @@ func TestParseToolCallsNoMarker(t *testing.T) {
 
 func TestStreamingDetectorByteFeeding(t *testing.T) {
 	block := "Sure! <｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"get_weather\">\n<｜｜DSML｜｜ parameter name=\"city\" string=\"true\">Beijing</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>\nDone."
-	det := newStreamingToolDetector(testTools, false)
+	det := newStreamingToolDetector(testTools, false, false)
 	var texts []string
 	var calls []ToolCall
 	for _, r := range block { // feed one rune at a time
@@ -154,7 +154,7 @@ func TestStreamingDetectorByteFeeding(t *testing.T) {
 
 func TestStreamingDetectorOrphanCloseTag(t *testing.T) {
 	// tools mode: orphan closing tags are stripped, never emitted
-	det := newStreamingToolDetector(testTools, false)
+	det := newStreamingToolDetector(testTools, false, false)
 	acts := det.feed("text </｜｜DSML｜｜ calls> more")
 	acts = append(acts, det.finalize()...)
 	var text string
@@ -171,7 +171,7 @@ func TestStreamingDetectorOrphanCloseTag(t *testing.T) {
 	}
 
 	// no-tools mode: orphan tags stay ordinary text
-	det2 := newStreamingToolDetector(nil, true)
+	det2 := newStreamingToolDetector(nil, true, false)
 	acts2 := det2.feed("text </｜｜DSML｜｜ calls> more")
 	acts2 = append(acts2, det2.finalize()...)
 	var text2 string
@@ -186,7 +186,7 @@ func TestStreamingDetectorOrphanCloseTag(t *testing.T) {
 }
 
 func TestStreamingDetectorUnclosedTail(t *testing.T) {
-	det := newStreamingToolDetector(testTools, false)
+	det := newStreamingToolDetector(testTools, false, false)
 	for _, r := range "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"bash\">\n<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">ls" {
 		det.feed(string(r))
 	}
@@ -201,7 +201,7 @@ func TestStreamingDetectorUnclosedTail(t *testing.T) {
 
 func TestStreamingDetectorSentinelFeed(t *testing.T) {
 	block := "<|tool_calls|>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n<|/tool_calls|>"
-	det := newStreamingToolDetector(testTools, false)
+	det := newStreamingToolDetector(testTools, false, false)
 	var calls []ToolCall
 	for _, r := range block {
 		for _, act := range det.feed(string(r)) {

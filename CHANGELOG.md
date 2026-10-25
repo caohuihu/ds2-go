@@ -58,6 +58,26 @@ All notable changes to this project will be documented in this file.
     If every account is dead, requests fail fast with 503.
   - Quarantine happens only on auth failures (401/403), never on 429 / 5xx / network errors.
 
+- **Tool-parsing robustness + reasoning fallback**
+  (ported from webai2api v0.1.20-v0.1.32, session behavior unchanged)
+  - **Argument-name correction**: a wrong argument key is renamed to the schema
+    parameter when a case-insensitive substring match is unique (`path` →
+    `filePath`); ambiguous or unknown keys are kept as-is.
+  - **Loose JSON repair**: model JSON with code fences, trailing commas or
+    full-width punctuation is repaired before parsing (sentinel lines and DSML
+    values).
+  - **Bare-JSON fallback** (`TOOL_JSON_FALLBACK`, default off): unmarked call
+    JSON is sniffed with a double criterion (name in the declared whitelist AND
+    an arguments/args key), so ordinary JSON and code samples stay text; the
+    streaming detector gains a matching JSON state.
+  - **Reasoning fallback** (`REASONING_FALLBACK`, default on): when the reply
+    body is empty but the thinking block carries the answer, the thinking text
+    is promoted to content (non-streaming swap / trailing content delta), so
+    clients never get a blank reply.
+  - Note: an earlier strategy-3 gate (SESSION_RECENT_FALLBACK) was tried and
+    reverted — it broke single-user session continuity, so session behavior
+    stays exactly as v1.1.1.
+
 ### Changed
 
 - `config.Config` struct extended with the four new fields above.

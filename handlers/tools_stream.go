@@ -37,18 +37,20 @@ const (
 	detScan detState = iota
 	detDSML
 	detSentinel
+	detJSON
 )
 
 type streamingToolDetector struct {
 	tools         []toolDef
 	requireMarker bool // no declared tools: only explicit markers parse; orphan tags pass as text
+	jsonFallback  bool // opt-in: sniff unmarked bare JSON as calls
 	state         detState
 	buf           string
 	closed        bool
 }
 
-func newStreamingToolDetector(tools []toolDef, requireMarker bool) *streamingToolDetector {
-	return &streamingToolDetector{tools: tools, requireMarker: requireMarker, state: detScan}
+func newStreamingToolDetector(tools []toolDef, requireMarker, jsonFallback bool) *streamingToolDetector {
+	return &streamingToolDetector{tools: tools, requireMarker: requireMarker, jsonFallback: jsonFallback, state: detScan}
 }
 
 // feed consumes one content delta and returns the client-visible actions.
@@ -71,6 +73,10 @@ func (d *streamingToolDetector) feed(delta string) []streamAction {
 			}
 		case detSentinel:
 			if !d.stepSentinel(&actions) {
+				return actions
+			}
+		case detJSON:
+			if !d.stepJSON(&actions) {
 				return actions
 			}
 		default:
@@ -164,6 +170,9 @@ func (d *streamingToolDetector) stepScan(actions *[]streamAction) bool {
 	case "sentinel_open":
 		d.state = detSentinel
 		return true
+	case "json_open":
+		d.state = detJSON
+		return true
 	}
 	return false
 }
@@ -189,11 +198,21 @@ func (d *streamingToolDetector) findEarliestScanToken() (int, string) {
 		}
 	}
 
+	// JSON anchors: only sniffed in tools mode with the JSON fallback on
+	if !d.requireMarker && d.jsonFallback {
+		for _, a := range jsonAnchors {
+			if i := strings.Index(d.buf, a); i >= 0 && (bestIdx < 0 || i < bestIdx) {
+				bestIdx, bestKind = i, "json_open"
+			}
+		}
+	}
+
 	return bestIdx, bestKind
 }
 
 // safePrefixLen returns how much of buf can be emitted as plain text.
-// A trailing unclosed "<..." may still become a marker tag, keep it.
+// A trailing unclosed "<..." may still become a marker tag, keep it. With
+// the JSON fallback on, a partial JSON anchor prefix is kept too.
 func (d *streamingToolDetector) safePrefixLen() int {
 	buf := d.buf
 	n := len(buf)
@@ -210,6 +229,26 @@ func (d *streamingToolDetector) safePrefixLen() int {
 				return i
 			}
 			break
+		}
+	}
+	if !d.requireMarker && d.jsonFallback {
+		best := n
+		for _, a := range jsonAnchors {
+			maxK := len(a)
+			if maxK > n {
+				maxK = n
+			}
+			for k := 1; k <= maxK; k++ {
+				suffix := buf[n-k:]
+				if strings.HasPrefix(a, suffix) {
+					if n-k < best {
+						best = n - k
+					}
+				}
+			}
+		}
+		if best < n {
+			return best
 		}
 	}
 	return n
@@ -292,6 +331,72 @@ func (d *streamingToolDetector) stepSentinel(actions *[]streamAction) bool {
 	d.buf = rest
 	d.state = detScan
 	return true
+}
+
+// ---- JSON (opt-in bare-JSON sniffing) ----
+
+// jsonAnchors are the string prefixes that open a candidate call blob.
+var jsonAnchors = []string{
+	`{"name"`, `{"tool_calls"`, `{"function"`,
+	`{ "name"`, `{ "tool_calls"`, `{ "function"`,
+}
+
+// stepJSON accumulates a brace-balanced JSON blob; on balance it parses
+// (opt-in double-criteria) and emits tool_calls, or the block as plain
+// text when it does not look like a call.
+func (d *streamingToolDetector) stepJSON(actions *[]streamAction) bool {
+	end := findJSONEnd(d.buf)
+	if end < 0 {
+		return false
+	}
+	block := d.buf[:end]
+	rest := d.buf[end:]
+	if calls := parseJSONCalls(block, d.tools); len(calls) > 0 {
+		*actions = append(*actions, streamAction{kind: actionToolCalls, calls: calls})
+	} else {
+		// not a call: emit as ordinary text
+		*actions = append(*actions, streamAction{kind: actionText, text: block})
+	}
+	d.buf = rest
+	d.state = detScan
+	return true
+}
+
+// findJSONEnd returns the index just past the matching '}' for the '{'
+// that starts s, respecting string literals; -1 when unbalanced.
+func findJSONEnd(s string) int {
+	if !strings.HasPrefix(s, "{") {
+		return -1
+	}
+	depth := 0
+	inStr, esc := false, false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if ch == '\\' {
+			esc = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		if ch == '{' {
+			depth++
+		} else if ch == '}' {
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return -1
 }
 
 // ---- history rendering / canonicalization ----

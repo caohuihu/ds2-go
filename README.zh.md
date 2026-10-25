@@ -144,6 +144,8 @@ PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' docker compose u
 | `HEALTH_PROBE_INTERVAL` | `30m` | 周期探测所有存活账号的间隔（0=关闭） |
 | `HEALTH_PROBE_DEAD_RETRY` | `10m` | 对被隔离账号的重试间隔（token 换新后自动复活） |
 | `HEALTH_LOG_FILE` | 同 `LOG_FILE` 目录 | 检测日志文件：隔离/复活/摘要事件，token 只显示掩码；留空默认与主日志同目录 |
+| `TOOL_JSON_FALLBACK` | `false` | 裸 JSON 工具调用嗅探（双判据：工具名在白名单 且 带 arguments 键），opt-in |
+| `REASONING_FALLBACK` | `true` | 正文为空而思考块有内容时，把思考内容补进正文 |
 
 ## 多轮对话
 
@@ -161,8 +163,10 @@ PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' docker compose u
 - 回传的 `role:"tool"` 结果与 assistant `tool_calls` 会重新渲染进 prompt（哨兵形式 / `[Tool Result id=...]` 行）；会话前缀缓存键纳入规范化的 `tool_calls` 结构，使 agent 每一轮都复用同一上游会话。
 - `tool_choice`：`auto`（默认）、`none`（忽略工具）、`required`、或 `{"type":"function","function":{"name":"..."}}`。
 - 模型输出的未知工具名会被丢弃（严格模式），不透传给 agent。
+- 模型写错的参数名按 schema 自动校正（大小写不敏感唯一子串命中才改名，如 `path` → `filePath`）；带小毛病的 JSON（代码围栏、尾逗号、全角标点）解析前自动修复。`TOOL_JSON_FALLBACK=true` 可开启无标记裸 JSON 嗅探（双判据：工具名在声明清单 且 带 arguments 键）。
 - agent 工具循环免除随机会话重置，读时间冷却上限压到 2s，保持循环响应。
 - `response_format: {"type":"json_object"}` 注入「仅输出 JSON」指令。
+- **空正文兜底**（`REASONING_FALLBACK`，默认开）：网页模型偶尔把最终答案只写进思考块、正文为空，此时把思考文本补进 `content`，客户端不会收到空回复。
 
 ## 账号健康检测（token 失效探测）
 
