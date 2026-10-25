@@ -36,10 +36,7 @@ type Config struct {
 	HealthProbeInterval       time.Duration // how often to actively probe live accounts (0 = disabled, default 30m)
 	HealthProbeDeadRetry      time.Duration // how often to re-probe quarantined accounts (0 = disabled, default 10m)
 	HealthLogFile             string        // dedicated token-health log file; empty = events go to main log only
-	StartupAccountCheck       bool          // probe all accounts once before serving (default true)
-	SessionRecentFallback     bool          // strategy-3: attach history-less requests to the most recent session of the model (default true; off for agent requests regardless)
-	ToolJSONFallback          bool          // sniff unmarked bare JSON as tool calls (double-criteria; default false)
-	ReasoningFallback         bool          // when the reply body is empty but the thinking block holds the answer, promote it to content (default true)
+	StartupAccountCheck       bool         // probe all accounts once before serving (default true)
 }
 
 // Load reads configuration from the environment. Accounts come from
@@ -77,9 +74,6 @@ func Load() (*Config, error) {
 		HealthProbeDeadRetry:      parseDurationEnv("HEALTH_PROBE_DEAD_RETRY", 10*time.Minute),
 		HealthLogFile:             env("HEALTH_LOG_FILE", ""),
 		StartupAccountCheck:       parseBoolEnv("STARTUP_ACCOUNT_CHECK", true),
-		SessionRecentFallback:     parseBoolEnv("SESSION_RECENT_FALLBACK", true),
-		ToolJSONFallback:          parseBoolEnv("TOOL_JSON_FALLBACK", false),
-		ReasoningFallback:         parseBoolEnv("REASONING_FALLBACK", true),
 	}
 	if cfg.ProxyAPIKey == "" {
 		return nil, fmt.Errorf("PROXY_API_KEY is required")
