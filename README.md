@@ -167,6 +167,7 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | `HEALTH_LOG_FILE` | 同 `LOG_FILE` 目录 | 检测日志文件：隔离/复活/摘要事件，token 只显示掩码；留空默认与主日志同目录（如 `/app/logs/deepseek-health.log`） |
 | `TOOL_JSON_FALLBACK` | `false` | Sniff unmarked bare JSON as tool calls (double criterion: name in whitelist AND has arguments); opt-in |
 | `REASONING_FALLBACK` | `true` | Promote thinking text to content when the reply body is empty |
+| `CONV_FINGERPRINT_ROUTE` | `false` | Route by conversation-opening fingerprint: first turn of a new task gets a fresh session on the next round-robin account; in-progress tasks re-attach to their own session/account |
 
 ## Multi-turn conversations
 
@@ -178,6 +179,14 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 - **Passthrough mode.** Responses include a non-standard `conversation_id`
   field (the DeepSeek session id). Send it in a later request body to reuse that
   session; only the last user message is used as the prompt.
+- **Task-level account distribution** (`CONV_FINGERPRINT_ROUTE`, default off).
+  With several concurrent tasks, each task keeps its own web session and new
+  tasks are dealt the next account in round-robin order, spreading load across
+  accounts. When on, requests without assistant history no longer use the
+  recent-session fallback (each becomes a fresh session).
+- **Round-robin fix.** Unbound prefixes previously resolved to account 0
+  (Go's map zero value), pinning every new session to the first account; new
+  sessions now genuinely rotate across all live accounts.
 
 > Cold start note: after a restart, if the history has more than one turn, only
 > the system prompt and the latest user message are replayed. This is a

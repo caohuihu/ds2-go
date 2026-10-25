@@ -39,6 +39,7 @@ type Config struct {
 	StartupAccountCheck       bool          // probe all accounts once before serving (default true)
 	ToolJSONFallback          bool          // sniff unmarked bare JSON as tool calls (double-criteria; default false)
 	ReasoningFallback         bool          // when the reply body is empty but the thinking block holds the answer, promote it to content (default true)
+	ConvFingerprintRoute      bool          // route conversations by their opening fingerprint; first turns start a fresh session on the next round-robin account (default false)
 }
 
 // Load reads configuration from the environment. Accounts come from
@@ -78,6 +79,7 @@ func Load() (*Config, error) {
 		StartupAccountCheck:       parseBoolEnv("STARTUP_ACCOUNT_CHECK", true),
 		ToolJSONFallback:          parseBoolEnv("TOOL_JSON_FALLBACK", false),
 		ReasoningFallback:         parseBoolEnv("REASONING_FALLBACK", true),
+		ConvFingerprintRoute:      parseBoolEnv("CONV_FINGERPRINT_ROUTE", false),
 	}
 	if cfg.ProxyAPIKey == "" {
 		return nil, fmt.Errorf("PROXY_API_KEY is required")

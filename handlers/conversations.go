@@ -48,6 +48,7 @@ type ConvStore struct {
 	mu                 sync.Mutex
 	byPrefix           map[string]*Conversation
 	bySession          map[string]*Conversation
+	byFingerprint      map[string]*Conversation // conversation-opening fingerprint -> conversation
 }
 
 func NewConvStore(ttlOptions []time.Duration, maxSize, requestsPerSession int) *ConvStore {
@@ -57,6 +58,7 @@ func NewConvStore(ttlOptions []time.Duration, maxSize, requestsPerSession int) *
 		requestsPerSession: requestsPerSession,
 		byPrefix:           make(map[string]*Conversation),
 		bySession:          make(map[string]*Conversation),
+		byFingerprint:      make(map[string]*Conversation),
 	}
 }
 
@@ -73,6 +75,14 @@ func (s *ConvStore) ByPrefix(key string) *Conversation {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.byPrefix[key]
+}
+
+// ByFingerprint looks up the conversation for a conversation-opening
+// fingerprint (see convFingerprint).
+func (s *ConvStore) ByFingerprint(key string) *Conversation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.byFingerprint[key]
 }
 
 // Evict removes a conversation from both maps. Call this when you want to
@@ -152,6 +162,24 @@ func (s *ConvStore) removeLocked(sessionKey string, conv *Conversation) {
 			delete(s.byPrefix, k)
 		}
 	}
+	for k, v := range s.byFingerprint {
+		if v == conv {
+			delete(s.byFingerprint, k)
+		}
+	}
+}
+
+// RegisterFingerprint stores a conversation under its conversation-opening
+// fingerprint. Unlike Register it does not bump the per-session request
+// counter or assign a TTL — the conversation is already tracked in
+// bySession; this only adds a second lookup key.
+func (s *ConvStore) RegisterFingerprint(key string, conv *Conversation) {
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.byFingerprint[key] = conv
 }
 
 // SweepLoop deletes DeepSeek sessions that have been idle past the TTL so the
@@ -235,6 +263,62 @@ func PrefixKey(messages []chatMessage, model string) string {
 		h.Write([]byte(m.ToolCallID))
 		h.Write([]byte{0x1e})
 	}
+	h.Write([]byte{0x00})
+	h.Write([]byte(model))
+	return hex.EncodeToString(h.Sum(nil)[:16])
+}
+
+// convFingerprint identifies a client-side conversation by its opening:
+// system + first user message + first assistant reply + model. Used when
+// CONV_FINGERPRINT_ROUTE is enabled:
+//
+//   - the first assistant reply anchors the key (like webai2api), so two
+//     conversations with the same opening text but different replies never
+//     collide;
+//   - a first-turn request (no assistant yet) computes a fingerprint that
+//     can never match a stored one (stored keys always carry the anchor),
+//     which is exactly what makes a new task start a fresh session;
+//   - the first assistant is taken in canonical tool_calls form so client
+//     re-serialization cannot break the match.
+func convFingerprint(messages []chatMessage, model string) string {
+	var system, firstUser, firstAsst string
+	for _, m := range messages {
+		switch m.Role {
+		case "system", "developer":
+			if system == "" {
+				system = contentText(m.Content)
+			}
+		case "user":
+			if firstUser == "" {
+				firstUser = contentFingerprint(m.Content)
+			}
+		case "assistant":
+			if firstAsst == "" {
+				if c := canonicalToolCalls(m.ToolCalls); c != "" {
+					firstAsst = c
+				} else {
+					firstAsst = contentFingerprint(m.Content)
+				}
+			}
+		}
+	}
+	// Bounded prefixes keep the key stable under cosmetic client prompt drift.
+	return fingerprintHash(system, firstUser, firstAsst, model)
+}
+
+func fingerprintHash(system, firstUser, firstAsst, model string) string {
+	bound := func(s string, n int) string {
+		if len(s) > n {
+			return s[:n]
+		}
+		return s
+	}
+	h := sha256.New()
+	h.Write([]byte(bound(system, 200)))
+	h.Write([]byte{0x00})
+	h.Write([]byte(bound(firstUser, 500)))
+	h.Write([]byte{0x00})
+	h.Write([]byte(bound(firstAsst, 200)))
 	h.Write([]byte{0x00})
 	h.Write([]byte(model))
 	return hex.EncodeToString(h.Sum(nil)[:16])

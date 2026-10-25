@@ -101,6 +101,9 @@ func main() {
 		if cfg.RequestsPerSession > 0 {
 			log.Printf("  requests per session     : %d (auto-rotate after N turns)", cfg.RequestsPerSession)
 		}
+		if cfg.ConvFingerprintRoute {
+			log.Printf("  conv fingerprint route : ON (new tasks get fresh sessions on round-robin accounts)")
+		}
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %v", err)
 		}

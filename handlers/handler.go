@@ -582,6 +582,16 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	h.convs.Register(key, conv)
 	log.Printf("chat: registered conv session=%s turns=%d keyLen=%d toolCalls=%d", conv.SessionID[:8], conv.Turn, len(key), len(emittedCalls))
 
+	// Conversation-opening fingerprint (CONV_FINGERPRINT_ROUTE): the next
+	// request of this task will compute the same fingerprint — system +
+	// first user + first assistant (now known) + model — and re-attach to
+	// this session/account no matter how its rolling prefix hashing turns
+	// out.
+	if h.cfg.ConvFingerprintRoute {
+		full := append(append([]chatMessage{}, req.Messages...), nextMsg)
+		h.convs.RegisterFingerprint(convFingerprint(full, m.ID), conv)
+	}
+
 	if err != nil {
 		if r.Context().Err() != nil {
 			return // client gone; upstream message completes on its own
@@ -692,14 +702,40 @@ func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool) (*
 		}
 	}
 
+	// Strategy 2.5 (only when the fingerprint router is on): match the
+	// conversation by its opening (system + first user + first assistant +
+	// model). Robust to rolling-prefix misses: mid-task requests re-attach
+	// to their own session even when the client's echoed history no longer
+	// hashes to a registered prefix.
+	firstTurn := lastAssistantIndex(req.Messages) < 0
+	if h.cfg.ConvFingerprintRoute && !firstTurn {
+		fp := convFingerprint(req.Messages, m.ID)
+		if c := h.convs.ByFingerprint(fp); c != nil {
+			log.Printf("chat: fingerprint hit session=%s turns=%d", c.SessionID[:8], c.Turn)
+			evict(c)
+			if h.convs.ByFingerprint(fp) == c {
+				return c, false, nil
+			}
+		}
+	}
+
 	// Strategy 3: fallback — reuse the most recently used session for this model.
 	// Same eviction logic: occasionally drop the cached session so concurrent
 	// requests don't all fight over the same one.
-	if c := h.convs.RecentForModel(m.ID); c != nil {
-		log.Printf("chat: strategy3 hit session=%s turns=%d", c.SessionID[:8], c.Turn)
-		evict(c)
-		if h.convs.BySession(c.SessionID) == c {
-			return c, false, nil
+	//
+	// Skipped for first-turn requests when the fingerprint router is on: a new
+	// task must start a fresh session on the next round-robin account, not be
+	// folded into whoever's session happens to be most recent. Mid-task
+	// requests keep the fallback as a last resort when their fingerprint
+	// misses (client mangled the echoed history).
+	skipRecent := h.cfg.ConvFingerprintRoute && firstTurn
+	if !skipRecent {
+		if c := h.convs.RecentForModel(m.ID); c != nil {
+			log.Printf("chat: strategy3 hit session=%s turns=%d", c.SessionID[:8], c.Turn)
+			evict(c)
+			if h.convs.BySession(c.SessionID) == c {
+				return c, false, nil
+			}
 		}
 	}
 	// Coalesce concurrent requests with the same prefix: instead of each
@@ -734,6 +770,27 @@ func (h *Handler) migrateOffDeadAccount(req *chatRequest, m *ModelInfo, toolLoop
 	return conv, fresh, nil
 }
 
+// resolveBoundAccount returns the pool index serving the prefix. Existing
+// bindings are kept; unbound prefixes and bindings pointing at quarantined
+// accounts take the next live account in round-robin order. The caller must
+// hold h.pendingMu. Returns -1 when no account is live.
+//
+// Note the two-value map read: a missing key must be treated as "unbound",
+// not as account 0 — the old single-value read returned Go's zero value and
+// pinned every new conversation to the first account.
+func (h *Handler) resolveBoundAccount(key string) int {
+	clientIdx, bound := h.prefixToClientIdx[key]
+	if !bound || clientIdx >= len(h.pool.clients) || h.pool.IsDead(clientIdx) {
+		live, ok := h.pool.NextLive()
+		if !ok {
+			return -1
+		}
+		h.prefixToClientIdx[key] = live
+		return live
+	}
+	return clientIdx
+}
+
 // coalesceOrCreate ensures all concurrent requests sharing the same prefix
 // reuse a single in-flight session creation. It also respects the prefix-to-
 // account binding so that the same prefix always lands on the same DeepSeek
@@ -759,25 +816,14 @@ func (h *Handler) coalesceOrCreate(key, modelID string) (*Conversation, error) {
 
 	// Determine which account to use for this prefix. A bound account keeps
 	// the conversation on the same DeepSeek session, preventing context loss.
-	// If the bound account has been quarantined (token expired), rebind the
-	// prefix to a live account so the conversation migrates forward.
-	clientIdx := h.prefixToClientIdx[key]
-	needBind := false
-	if clientIdx >= len(h.pool.clients) || h.pool.IsDead(clientIdx) {
-		// Unseen prefix, or bound to a dead account — pick a live client in
-		// round-robin order, skipping quarantined accounts.
-		live, ok := h.pool.NextLive()
-		if !ok {
-			// No live accounts: clean up and fail fast with a clear error.
-			delete(h.pending, key)
-			h.pendingMu.Unlock()
-			return nil, errNoLiveAccount
-		}
-		clientIdx = live
-		needBind = true
-	}
-	if needBind {
-		h.prefixToClientIdx[key] = clientIdx
+	// Unbound prefixes and prefixes bound to a quarantined account are (re)
+	// bound to the next live account in round-robin order.
+	clientIdx := h.resolveBoundAccount(key)
+	if clientIdx < 0 {
+		// No live accounts: clean up and fail fast with a clear error.
+		delete(h.pending, key)
+		h.pendingMu.Unlock()
+		return nil, errNoLiveAccount
 	}
 	boundClient := h.pool.clients[clientIdx]
 

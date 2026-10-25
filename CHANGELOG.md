@@ -74,9 +74,23 @@ All notable changes to this project will be documented in this file.
     body is empty but the thinking block carries the answer, the thinking text
     is promoted to content (non-streaming swap / trailing content delta), so
     clients never get a blank reply.
-  - Note: an earlier strategy-3 gate (SESSION_RECENT_FALLBACK) was tried and
-    reverted — it broke single-user session continuity, so session behavior
-    stays exactly as v1.1.1.
+   - Note: an earlier strategy-3 gate (SESSION_RECENT_FALLBACK) was tried and
+     reverted — it broke single-user session continuity, so session behavior
+     stays exactly as v1.1.1.
+
+- **Task-level account distribution via conversation-start fingerprint**
+  (`handlers/handler.go`, `handlers/conversations.go`)
+  - New `CONV_FINGERPRINT_ROUTE` (default off): when enabled, in-progress
+    requests re-attach to their own session by the fingerprint of the
+    conversation opening (system + first user message + first assistant reply
+    + model), which stays robust even when the rolling-prefix cache misses.
+  - When enabled, the first turn of a new task (no assistant message yet)
+    skips the recent-session fallback and gets a fresh web session on the next
+    account in round-robin order, so distinct tasks spread across accounts.
+  - **Round-robin fix**: the prefix→account binding used Go's single-value map
+    read, so an unbound prefix silently resolved to account 0 and every new
+    session pinned to the first account; unbound prefixes now genuinely
+    rotate through all live accounts.
 
 ### Changed
 
