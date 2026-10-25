@@ -33,7 +33,27 @@ func main() {
 
 	convs := handlers.NewConvStore(cfg.ConversationTTLOptions, cfg.MaxConvs, cfg.RequestsPerSession)
 	rotateInterval := time.Duration(cfg.DeviceIDRotateHours) * time.Hour
-	h := handlers.New(cfg, handlers.NewPool(cfg.Accounts, cfg.PowJitterMin, cfg.PowJitterMax, rotateInterval), convs)
+	pool := handlers.NewPool(cfg.Accounts, cfg.PowJitterMin, cfg.PowJitterMax, rotateInterval)
+	h := handlers.New(cfg, pool, convs)
+
+	// Token health: dedicated log file + startup check + background probes.
+	hc, err := handlers.NewHealthChecker(pool, cfg.HealthLogFile)
+	if err != nil {
+		log.Printf("health: %v (events will go to the main log only)", err)
+	}
+	h.SetHealthChecker(hc)
+	defer hc.Close()
+
+	if cfg.StartupAccountCheck {
+		log.Printf("health: startup account check, probing %d accounts...", len(cfg.Accounts))
+		hc.ProbeAll()
+		if pool.LiveCount() == 0 {
+			log.Printf("health: WARNING: 0/%d accounts usable, requests will fail until tokens are refreshed", len(cfg.Accounts))
+		}
+	}
+	probeCtx, stopProbe := context.WithCancel(context.Background())
+	defer stopProbe()
+	hc.Start(probeCtx, cfg.HealthProbeInterval, cfg.HealthProbeDeadRetry)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +93,11 @@ func main() {
 		}())
 		log.Printf("  request read time        : %s ~ %s", cfg.RequestReadTimeMin, cfg.RequestReadTimeMax)
 		log.Printf("  session reset chance     : %.0f%%", cfg.SessionResetChance*100)
+		if cfg.HealthLogFile != "" {
+			log.Printf("  health log file        : %s", cfg.HealthLogFile)
+		}
+		log.Printf("  health probe             : live every %s, dead retry every %s (startup check %v)",
+			cfg.HealthProbeInterval, cfg.HealthProbeDeadRetry, cfg.StartupAccountCheck)
 		if cfg.RequestsPerSession > 0 {
 			log.Printf("  requests per session     : %d (auto-rotate after N turns)", cfg.RequestsPerSession)
 		}

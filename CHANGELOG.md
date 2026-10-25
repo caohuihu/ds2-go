@@ -44,6 +44,19 @@ All notable changes to this project will be documented in this file.
   - Strict tool-name mode: calls whose name is not in the declared tool set are dropped, not forwarded.
   - `response_format: {"type":"json_object"}` injects a JSON-only directive.
 
+- **Account token-expiry detection** (`handlers/health.go`)
+  - A dedicated detection log file (`HEALTH_LOG_FILE`, default `deepseek-health.log`) records
+    quarantines, revivals and a running one-line summary; tokens are only ever printed masked
+    (`ab12cd…ef90`).
+  - **Startup check** (`STARTUP_ACCOUNT_CHECK`, default on): every account is probed before the
+    server starts, using a side-effect-free auth request (PoW-challenge fetch).
+  - **Periodic probes**: live accounts every `HEALTH_PROBE_INTERVAL` (default 30 m), quarantined
+    accounts retried every `HEALTH_PROBE_DEAD_RETRY` (default 10 m) so refreshed tokens revive.
+  - **Passive quarantine**: a 401/403 seen during a real completion quarantines the account
+    immediately; conversations bound to it migrate to a live account with full history replay.
+    If every account is dead, requests fail fast with 503.
+  - Quarantine happens only on auth failures (401/403), never on 429 / 5xx / network errors.
+
 ### Changed
 
 - `config.Config` struct extended with the four new fields above.

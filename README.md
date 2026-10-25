@@ -161,6 +161,10 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | `SESSION_RESET_CHANCE` | `0.15` | 每次请求有 X% 概率开新会话（同时影响 Strategy 2 和 Strategy 3，控制连续问答的"断句"频率） |
 | `REQUESTS_PER_SESSION` | `0` | 每个会话最大请求数，到达后强制创建新会话（0=关闭，与 SESSION_RESET_CHANCE 配合使用） |
 | `LOG_FILE` | `/app/logs/app.log` | 日志文件路径，留空只输出到 stdout；设置后日志同时写入文件 |
+| `STARTUP_ACCOUNT_CHECK` | `true` | 启动时对全部账号做一次轻量鉴权探测，失效账号自动隔离 |
+| `HEALTH_PROBE_INTERVAL` | `30m` | 周期探测所有存活账号的间隔（0=关闭） |
+| `HEALTH_PROBE_DEAD_RETRY` | `10m` | 对被隔离账号的重试间隔（token 换新后自动复活） |
+| `HEALTH_LOG_FILE` | `deepseek-health.log` | 检测日志文件：隔离/复活/摘要事件，token 只显示掩码 |
 
 ## Multi-turn conversations
 
@@ -204,6 +208,34 @@ simulates it at the text layer (the same approach webai2api uses):
 - Agent tool loops are exempted from the random session-reset chance and the
   read-time cooldown is capped at 2s so the loop stays responsive.
 - `response_format: {"type":"json_object"}` injects a "JSON only" directive.
+
+## Account health (token expiry detection)
+
+DeepSeek web tokens expire silently; this proxy detects it instead of only
+finding out mid-request:
+
+- **Startup check** — before serving, every account is probed with a
+  side-effect-free auth request (PoW-challenge fetch). Expired accounts are
+  quarantined up front.
+- **Periodic probes** — every `HEALTH_PROBE_INTERVAL` (default 30 min) all
+  live accounts are re-probed; quarantined accounts are retried every
+  `HEALTH_PROBE_DEAD_RETRY` (default 10 min) so a refreshed token revives
+  without a restart.
+- **Passive quarantine** — a 401/403 observed during a real completion
+  quarantines that account immediately. Conversations bound to it are
+  migrated to a live account with a full history replay; if *all* accounts
+  are dead, requests fail fast with a clear 503.
+- **Detection log** — every quarantine/revival and a running summary are
+  appended to `HEALTH_LOG_FILE` (default `deepseek-health.log`). Tokens are
+  only ever printed masked (`ab12cd…ef90`), so the file is safe to keep:
+
+  ```
+  2026-10-25T01:00:03+08:00 [probe] #1/5 ab12cd…ef90 EXPIRED (upstream http 401) → quarantined
+  2026-10-25T01:00:03+08:00 [summary] total=5 live=4 quarantined=1 [#1 upstream http 401]
+  ```
+
+  `tail -f deepseek-health.log` tells you exactly which line of
+  `accounts.txt` to replace.
 
 ## Authentication
 

@@ -140,6 +140,10 @@ PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' docker compose u
 | `DEFAULT_MODEL` | `deepseek-chat` | 请求未指定模型时使用 |
 | `CONVERSATION_TTL` | `30m` | 会话空闲多久后从上游删除 |
 | `MAX_CONVERSATIONS` | `1024` | 内存中保留的最大会话数（LRU 淘汰） |
+| `STARTUP_ACCOUNT_CHECK` | `true` | 启动时对全部账号做一次轻量鉴权探测，失效账号自动隔离 |
+| `HEALTH_PROBE_INTERVAL` | `30m` | 周期探测所有存活账号的间隔（0=关闭） |
+| `HEALTH_PROBE_DEAD_RETRY` | `10m` | 对被隔离账号的重试间隔（token 换新后自动复活） |
+| `HEALTH_LOG_FILE` | `deepseek-health.log` | 检测日志文件：隔离/复活/摘要事件，token 只显示掩码 |
 
 ## 多轮对话
 
@@ -159,6 +163,22 @@ PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' docker compose u
 - 模型输出的未知工具名会被丢弃（严格模式），不透传给 agent。
 - agent 工具循环免除随机会话重置，读时间冷却上限压到 2s，保持循环响应。
 - `response_format: {"type":"json_object"}` 注入「仅输出 JSON」指令。
+
+## 账号健康检测（token 失效探测）
+
+DeepSeek 网页 token 会静默失效。本代理主动检测，而不是等到请求中途才发现：
+
+- **启动校验**：服务启动、开始监听前，对每个账号做一次无副作用的鉴权探测（PoW-challenge 拉取）。失效账号当场隔离。
+- **周期探测**：每 `HEALTH_PROBE_INTERVAL`（默认 30m）重探全部存活账号；被隔离账号每 `HEALTH_PROBE_DEAD_RETRY`（默认 10m）重试一次，token 换新后无需重启即自动复活。
+- **使用中被动隔离**：真实补全请求里一旦看到 401/403，立刻隔离该账号；绑定在它上面的会话会被迁移到存活账号并全量重放历史；若所有账号都失效，请求快速失败并返回清晰的 503。
+- **检测日志**：每次隔离/复活以及一条滚动摘要都追加到 `HEALTH_LOG_FILE`（默认 `deepseek-health.log`）。token 一律只打印掩码（`ab12cd…ef90`），文件可安全保留：
+
+  ```
+  2026-10-25T01:00:03+08:00 [probe] #1/5 ab12cd…ef90 EXPIRED (upstream http 401) → quarantined
+  2026-10-25T01:00:03+08:00 [summary] total=5 live=4 quarantined=1 [#1 upstream http 401]
+  ```
+
+  `tail -f deepseek-health.log` 即可知道要替换 `accounts.txt` 的哪一行。
 
 ## 认证方式
 

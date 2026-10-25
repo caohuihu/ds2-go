@@ -98,3 +98,24 @@
 
 - 思源笔记 / Open WebUI / Cherry Studio / 任意 OpenAI SDK 的 agent 循环（写日记、调工具、回填结果）可完整跑通，不再把 DeepSeek 网页命令当纯文本显示。
 
+### 账号 token 失效检测（独立检测日志）
+
+DeepSeek 网页 token 会静默失效，此前只能在实际请求中途才发现。本轮加入主动检测 + 自愈 + 独立检测日志：
+
+- **新增文件** `handlers/health.go`：
+  - `AccountPool` 增加隔离状态机（`dead` map，`IsDead`/`Quarantine`/`Revive`/`NextLive`/`HasLive`）；`NextLive` 轮询时跳过被隔离账号。
+  - `HealthChecker`：用无副作用的鉴权请求（PoW-challenge 拉取）探测账号存活；事件追加写入 `HEALTH_LOG_FILE`（默认 `deepseek-health.log`），token 一律只打掩码（`ab12cd…ef90`）。
+  - 启动校验（`STARTUP_ACCOUNT_CHECK`，默认开）：监听前探测全部账号，失效的当场隔离。
+  - 周期探测：存活账号每 `HEALTH_PROBE_INTERVAL`（默认 30m），被隔离账号每 `HEALTH_PROBE_DEAD_RETRY`（默认 10m）重试，token 换新后免重启自动复活。
+- **`handlers/handler.go`**：
+  - 被动隔离：真实补全请求出现 401/403 时立即隔离该账号并写检测日志。
+  - 会话迁移：绑定在被隔离账号上的会话会被 `Evict` 并重新解析到存活账号、全量重放历史（`migrateOffDeadAccount`）。
+  - `coalesceOrCreate`：前缀绑定的账号若已失效，经 `NextLive` 重绑到存活账号；全部失效时返回 `errNoLiveAccount`。
+  - `mapUpstreamError`：`errNoLiveAccount` 映射为 503。
+- **`config/config.go`**：新增 4 个字段（`HealthProbeInterval` / `HealthProbeDeadRetry` / `HealthLogFile` / `StartupAccountCheck`）与 `parseBoolEnv`。
+- **`main.go`**：接线 HealthChecker、启动探测、启动日志输出。
+- **文档**：`.env.example` 增加账号健康检测配置块；README（中/英）增加「账号健康检测」章节与配置表行。
+
+> 使用：`tail -f deepseek-health.log`，看 `[summary]` 行与 `EXPIRED … quarantined` 行即可定位 `accounts.txt` 里哪一行 token 需要重新抓取替换。
+
+

@@ -86,10 +86,15 @@ func resolveModel(name string) (*ModelInfo, bool) {
 type AccountPool struct {
 	clients []*deepseek.Client
 	next    atomic.Uint64
+	// mu protects dead: quarantined account index → reason. Quarantine
+	// happens only on upstream auth failures (401/403), never on 429, 5xx
+	// or network errors. See health.go for the state-machine methods.
+	mu   sync.Mutex
+	dead map[int]string
 }
 
 func NewPool(tokens []string, powJitterMin, powJitterMax, rotateInterval time.Duration) *AccountPool {
-	p := &AccountPool{}
+	p := &AccountPool{dead: make(map[int]string)}
 	for _, t := range tokens {
 		p.clients = append(p.clients, deepseek.NewClient(t, powJitterMin, powJitterMax, rotateInterval))
 	}
@@ -106,7 +111,10 @@ type Handler struct {
 	pool    *AccountPool
 	convs   *ConvStore
 	limiter *AccountLimiter
-	mu      sync.Mutex // protects lastRequestAt
+	// health is optional; when set, 401/403 in the request path quarantine
+	// the offending account and are recorded in the health log file.
+	health *HealthChecker
+	mu     sync.Mutex // protects lastRequestAt
 	// lastRequestAt tracks the time of the last request per client pointer,
 	// enforcing a cooldown to simulate a human reading the reply.
 	lastRequestAt map[*deepseek.Client]time.Time
@@ -144,6 +152,12 @@ func New(cfg *config.Config, pool *AccountPool, convs *ConvStore) *Handler {
 		go h.startDeviceIDRotation()
 	}
 	return h
+}
+
+// SetHealthChecker attaches the optional token-health checker used to
+// quarantine accounts that fail upstream auth checks.
+func (h *Handler) SetHealthChecker(hc *HealthChecker) {
+	h.health = hc
 }
 
 // startDeviceIDRotation periodically rotates DeviceIDs across all accounts
@@ -300,6 +314,18 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	useToolPath := activeTools || toolFlow
 
 	conv, fresh, err := h.conversation(&req, m, toolFlow)
+	if err != nil {
+		log.Printf("chat: create session failed: %v", err)
+		status, msg := mapUpstreamError(err)
+		writeError(w, status, "api_error", msg)
+		return
+	}
+
+	// If the chosen conversation sits on an account that has since been
+	// quarantined (its token expired), migrate it to a live account before
+	// locking: evict the stale session and re-resolve so the prefix re-binds
+	// to a live account with a full history replay.
+	conv, fresh, err = h.migrateOffDeadAccount(&req, m, toolFlow, conv, fresh)
 	if err != nil {
 		log.Printf("chat: create session failed: %v", err)
 		status, msg := mapUpstreamError(err)
@@ -485,6 +511,25 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 
 	err = h.chatWithRetry(r.Context(), conv, input, cb)
 
+	// Passive detection: an upstream auth failure observed mid-request
+	// quarantines the account immediately so the next request migrates off
+	// it (see migrateOffDeadAccount). Only 401/403 qualify — 429 stays a
+	// rate-limit, not a token problem.
+	if err != nil {
+		var ae *deepseek.APIError
+		if errors.As(err, &ae) && (ae.HTTPStatus == 401 || ae.HTTPStatus == 403) {
+			idx := h.pool.IndexOf(conv.Client)
+			if idx >= 0 {
+				reason := fmt.Sprintf("upstream http %d during completion", ae.HTTPStatus)
+				if h.health != nil {
+					h.health.EventQuarantine(idx, reason)
+				} else {
+					h.pool.Quarantine(idx, reason)
+				}
+			}
+		}
+	}
+
 	// Record this request time for the next cooldown calculation.
 	h.recordRequestTime(conv.Client)
 
@@ -654,6 +699,28 @@ func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool) (*
 	return conv, true, nil
 }
 
+// migrateOffDeadAccount moves a conversation whose account has since been
+// quarantined onto a live account. Each iteration evicts the stale session
+// and re-resolves; coalesceOrCreate rebinds the prefix to a live account via
+// NextLive and the new session replays the full history (fresh=true). It
+// stops as soon as the conversation lands on a live account.
+func (h *Handler) migrateOffDeadAccount(req *chatRequest, m *ModelInfo, toolLoop bool, conv *Conversation, fresh bool) (*Conversation, bool, error) {
+	for attempt := 0; attempt < 4; attempt++ {
+		idx := h.pool.IndexOf(conv.Client)
+		if idx >= 0 && !h.pool.IsDead(idx) {
+			return conv, fresh, nil
+		}
+		log.Printf("chat: conversation %s sits on dead account #%d, migrating to a live account", conv.SessionID[:8], idx+1)
+		h.convs.Evict(conv.SessionID)
+		var err error
+		conv, fresh, err = h.conversation(req, m, toolLoop)
+		if err != nil {
+			return conv, fresh, err
+		}
+	}
+	return conv, fresh, nil
+}
+
 // coalesceOrCreate ensures all concurrent requests sharing the same prefix
 // reuse a single in-flight session creation. It also respects the prefix-to-
 // account binding so that the same prefix always lands on the same DeepSeek
@@ -679,11 +746,21 @@ func (h *Handler) coalesceOrCreate(key, modelID string) (*Conversation, error) {
 
 	// Determine which account to use for this prefix. A bound account keeps
 	// the conversation on the same DeepSeek session, preventing context loss.
+	// If the bound account has been quarantined (token expired), rebind the
+	// prefix to a live account so the conversation migrates forward.
 	clientIdx := h.prefixToClientIdx[key]
 	needBind := false
-	if clientIdx >= len(h.pool.clients) {
-		// First time seeing this prefix — pick next client in round-robin order.
-		clientIdx = int(h.pool.next.Add(1)) % len(h.pool.clients)
+	if clientIdx >= len(h.pool.clients) || h.pool.IsDead(clientIdx) {
+		// Unseen prefix, or bound to a dead account — pick a live client in
+		// round-robin order, skipping quarantined accounts.
+		live, ok := h.pool.NextLive()
+		if !ok {
+			// No live accounts: clean up and fail fast with a clear error.
+			delete(h.pending, key)
+			h.pendingMu.Unlock()
+			return nil, errNoLiveAccount
+		}
+		clientIdx = live
 		needBind = true
 	}
 	if needBind {
@@ -761,6 +838,9 @@ func (h *Handler) buildUsage(conv *Conversation, total int64, replyChars int) ma
 }
 
 func mapUpstreamError(err error) (int, string) {
+	if errors.Is(err, errNoLiveAccount) {
+		return http.StatusServiceUnavailable, errNoLiveAccount.Error()
+	}
 	var ae *deepseek.APIError
 	if errors.As(err, &ae) {
 		switch {

@@ -32,6 +32,10 @@ type Config struct {
 	SessionResetChance        float64       // probabilistic session reset chance (0-1)
 	RequestsPerSession        int           // max requests per DeepSeek session before forcing a new one (0 = disabled, use SessionResetChance only)
 	LogFile                   string        // optional log file path; empty = stdout only
+	HealthProbeInterval       time.Duration // how often to actively probe live accounts (0 = disabled, default 30m)
+	HealthProbeDeadRetry      time.Duration // how often to re-probe quarantined accounts (0 = disabled, default 10m)
+	HealthLogFile             string        // dedicated token-health log file; empty = events go to main log only
+	StartupAccountCheck       bool         // probe all accounts once before serving (default true)
 }
 
 // Load reads configuration from the environment. Accounts come from
@@ -65,6 +69,10 @@ func Load() (*Config, error) {
 		SessionResetChance:        parseFloatEnv("SESSION_RESET_CHANCE", 0.15),
 		RequestsPerSession:        parseIntEnv("REQUESTS_PER_SESSION", 0),
 		LogFile:                   env("LOG_FILE", ""),
+		HealthProbeInterval:       parseDurationEnv("HEALTH_PROBE_INTERVAL", 30*time.Minute),
+		HealthProbeDeadRetry:      parseDurationEnv("HEALTH_PROBE_DEAD_RETRY", 10*time.Minute),
+		HealthLogFile:             env("HEALTH_LOG_FILE", "deepseek-health.log"),
+		StartupAccountCheck:       parseBoolEnv("STARTUP_ACCOUNT_CHECK", true),
 	}
 	if cfg.ProxyAPIKey == "" {
 		return nil, fmt.Errorf("PROXY_API_KEY is required")
@@ -179,4 +187,19 @@ func parseFloatEnv(key string, def float64) float64 {
 		}
 	}
 	return def
+}
+
+// parseBoolEnv reads a boolean env var ("1", "true", "yes", "on" are true;
+// "0", "false", "no", "off" are false), falling back to def when unset or
+// unparseable.
+func parseBoolEnv(key string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }
