@@ -72,6 +72,22 @@ func (p *AccountPool) IndexOf(c *deepseek.Client) int {
 	return -1
 }
 
+// FindByMask returns the pool index of the account whose token matches the
+// given maskToken representation (-1 when unknown or quarantined). Used to
+// re-map persisted session records after a restart: token prefixes survive
+// accounts.txt reordering, bare indexes do not.
+func (p *AccountPool) FindByMask(masked string) int {
+	if masked == "" {
+		return -1
+	}
+	for i, c := range p.clients {
+		if maskToken(c.Token) == masked && !p.IsDead(i) {
+			return i
+		}
+	}
+	return -1
+}
+
 // LiveCount returns how many accounts are not quarantined.
 func (p *AccountPool) LiveCount() int {
 	p.mu.Lock()

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -54,6 +55,19 @@ func main() {
 	probeCtx, stopProbe := context.WithCancel(context.Background())
 	defer stopProbe()
 	hc.Start(probeCtx, cfg.HealthProbeInterval, cfg.HealthProbeDeadRetry)
+
+	// Session persistence (PERSIST_SESSIONS): restore the conversation index
+	// from the data file so long-running client tasks survive a restart, and
+	// wire every store removal to a throttled re-persist.
+	var persist *handlers.ConvPersister
+	if cfg.PersistSessions {
+		persist = h.WirePersistence(filepath.Join(cfg.DataDir, "conversations.json"))
+	}
+	defer func() {
+		if persist != nil {
+			persist.Close()
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -103,6 +117,9 @@ func main() {
 		}
 		if cfg.ConvFingerprintRoute {
 			log.Printf("  conv fingerprint route : ON (new tasks get fresh sessions on round-robin accounts)")
+		}
+		if cfg.PersistSessions {
+			log.Printf("  session persistence    : ON (%s)", filepath.Join(cfg.DataDir, "conversations.json"))
 		}
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %v", err)

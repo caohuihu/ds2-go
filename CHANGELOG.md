@@ -87,10 +87,32 @@ All notable changes to this project will be documented in this file.
   - When enabled, the first turn of a new task (no assistant message yet)
     skips the recent-session fallback and gets a fresh web session on the next
     account in round-robin order, so distinct tasks spread across accounts.
-  - **Round-robin fix**: the prefix→account binding used Go's single-value map
-    read, so an unbound prefix silently resolved to account 0 and every new
-    session pinned to the first account; unbound prefixes now genuinely
-    rotate through all live accounts.
+   - **Round-robin fix**: the prefix→account binding used Go's single-value map
+     read, so an unbound prefix silently resolved to account 0 and every new
+     session pinned to the first account; unbound prefixes now genuinely
+     rotate through all live accounts.
+
+- **Session persistence across restarts** (`handlers/persist.go`,
+  `handlers/handler.go`, `handlers/conversations.go`)
+  - New `PERSIST_SESSIONS` (default off) + `DATA_DIR` (default: the `data/`
+    folder one level beside the log dir). The conversation index
+    (prefix / fingerprint / session-id keys → session record incl. owning
+    account) is snapshotted to `<DATA_DIR>/conversations.json`.
+  - Writes are throttled (5 s, coalesced triggers) and atomic (tmp + rename);
+    a final flush runs on shutdown. A corrupt file is quarantined
+    (`*.corrupt-<ts>`) instead of crashing.
+  - On startup the index is restored: sessions keep their prefix/fingerprint
+    lookups, their prefix→account binding (so task a stays on account A), and
+    their turn counts. Entries past their idle TTL, or whose account no longer
+    exists / is quarantined, are dropped.
+  - **Session self-heal**: a cached session that fails with a non-auth error
+    (404/5xx/network — "the upstream session is probably dead") is recreated
+    on the same account with a full history replay and retried once
+    (non-streaming requests only). 401/403 still go to quarantine+migration;
+    429 to backoff.
+  - New pool helper `FindByMask` re-maps persisted account ids (masked token
+    prefixes) to current pool indices after an `accounts.txt` reorder.
+
 
 ### Changed
 

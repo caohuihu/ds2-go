@@ -49,6 +49,10 @@ type ConvStore struct {
 	byPrefix           map[string]*Conversation
 	bySession          map[string]*Conversation
 	byFingerprint      map[string]*Conversation // conversation-opening fingerprint -> conversation
+	// onRemove fires after any conversation is removed (evict / LRU / sweep /
+	// per-session cap); the handler wires it to the persistence marker.
+	// Must be non-blocking — it runs while the store lock is held.
+	onRemove func()
 }
 
 func NewConvStore(ttlOptions []time.Duration, maxSize, requestsPerSession int) *ConvStore {
@@ -167,6 +171,17 @@ func (s *ConvStore) removeLocked(sessionKey string, conv *Conversation) {
 			delete(s.byFingerprint, k)
 		}
 	}
+	if s.onRemove != nil {
+		s.onRemove()
+	}
+}
+
+// SetRemoveHook installs the callback fired whenever a conversation is
+// removed from the store (for persisting deletions to disk).
+func (s *ConvStore) SetRemoveHook(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onRemove = fn
 }
 
 // RegisterFingerprint stores a conversation under its conversation-opening
@@ -180,6 +195,91 @@ func (s *ConvStore) RegisterFingerprint(key string, conv *Conversation) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.byFingerprint[key] = conv
+}
+
+// ConvRecord is the on-disk form of one session record: the session plus
+// every lookup key pointing at it (session-id keys are implicit; prefix and
+// fingerprint keys are listed explicitly).
+type ConvRecord struct {
+	SessionID       string   `json:"session_id"`
+	Model           string   `json:"model,omitempty"`
+	Account         string   `json:"account,omitempty"` // maskToken of the owning account
+	Turns           int      `json:"turns,omitempty"`
+	LastUsed        int64    `json:"last_used"` // unix seconds
+	Expiry          int64    `json:"expiry,omitempty"` // unix seconds; 0 = never
+	PrefixKeys      []string `json:"prefix_keys,omitempty"`
+	FingerprintKeys []string `json:"fingerprint_keys,omitempty"`
+}
+
+func recordOf(c *Conversation) ConvRecord {
+	rec := ConvRecord{SessionID: c.SessionID, Model: c.ModelID, Turns: c.turnCount}
+	if !c.LastUsed.IsZero() {
+		rec.LastUsed = c.LastUsed.Unix()
+		if c.ttl > 0 {
+			rec.Expiry = c.LastUsed.Add(c.ttl).Unix()
+		}
+	}
+	if c.Client != nil {
+		rec.Account = maskToken(c.Client.Token)
+	}
+	return rec
+}
+
+// Snapshot returns the persisted form of every tracked session: one record
+// per session id, carrying all its prefix/fingerprint lookup keys.
+func (s *ConvStore) Snapshot() map[string]ConvRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]ConvRecord, len(s.bySession))
+	for sid, c := range s.bySession {
+		out[sid] = recordOf(c)
+	}
+	for k, c := range s.byPrefix {
+		if rec, ok := out[c.SessionID]; ok {
+			rec.PrefixKeys = append(rec.PrefixKeys, k)
+			out[c.SessionID] = rec
+		}
+	}
+	for k, c := range s.byFingerprint {
+		if rec, ok := out[c.SessionID]; ok {
+			rec.FingerprintKeys = append(rec.FingerprintKeys, k)
+			out[c.SessionID] = rec
+		}
+	}
+	return out
+}
+
+// LoadSnapshot rebuilds the in-memory maps from persisted records. Callers
+// supply the Conversation values (account clients already re-mapped); the
+// store wires up every lookup key and enforces capacity like Register.
+// Returns the number of sessions restored.
+func (s *ConvStore) LoadSnapshot(bySession map[string]*Conversation, prefixKeys, fingerprintKeys map[string]string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for sid, c := range bySession {
+		s.bySession[sid] = c
+	}
+	for k, sid := range prefixKeys {
+		if c := s.bySession[sid]; c != nil {
+			s.byPrefix[k] = c
+		}
+	}
+	for k, sid := range fingerprintKeys {
+		if c := s.bySession[sid]; c != nil {
+			s.byFingerprint[k] = c
+		}
+	}
+	for len(s.bySession) > s.maxSize {
+		var oldestKey string
+		var oldest *Conversation
+		for key, c := range s.bySession {
+			if oldest == nil || c.LastUsed.Before(oldest.LastUsed) {
+				oldestKey, oldest = key, c
+			}
+		}
+		s.removeLocked(oldestKey, oldest)
+	}
+	return len(s.bySession)
 }
 
 // SweepLoop deletes DeepSeek sessions that have been idle past the TTL so the

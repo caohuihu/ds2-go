@@ -134,5 +134,15 @@ DeepSeek 网页 token 会静默失效，此前只能在实际请求中途才发�
 - **任务级账号分发**（`CONV_FINGERPRINT_ROUTE`，默认关，`handlers/handler.go` + `handlers/conversations.go`）：开启后，任务进行中的请求按「系统 + 首条指令 + 首轮回复 + 模型」指纹回到本任务的会话/账号（滚动前缀缓存 miss 也不受影响）；新任务第一回合（消息里无 assistant）跳过最近会话兜底，必然新建网页会话并轮询到下一个账号——任务 a→账号 A、任务 b→账号 B，风控负载按任务数摊薄，任务内保持单会话零重放。
 - **轮询 bug 修复**（`handlers/handler.go` `resolveBoundAccount`）：此前前缀→账号绑定用 Go 单值 map 读取，未绑定前缀静默落到账号 0，导致**所有新会话都钉在第一个账号**（轮询实际失效，只在账号被隔离后才换号）；修复后未绑定前缀真正在所有存活账号间轮询。
 
+### 会话持久化（任务跨重启继续）+ 会话死亡自愈
+
+- **会话持久化**（`PERSIST_SESSIONS` + `DATA_DIR`，默认关，`handlers/persist.go` + `handlers/handler.go` + `handlers/conversations.go`）：开启后把「前缀键 / 指纹键 / 会话ID → 会话记录（含所属账号）」索引快照到 `<DATA_DIR>/conversations.json`（默认日志同层 `data/` 目录，如 `/app/data`）。
+  - 写入 5 秒节流 + 触发合并 + 原子替换（tmp + rename）；关机前强制 flush；文件损坏时改名隔离（`*.corrupt-<时间戳>`）而非崩溃。
+  - 重启启动时自动恢复：任务 a 继续命中同一网页会话、同一账号 A（前缀→账号绑定一并恢复），无需从头重放上下文；`turn_count` 等 bookkeeping 字段也恢复。
+  - 恢复时自动丢弃：已超空闲 TTL 的会话（其上游会话已被 sweep 删除）、账号已删除/被隔离的会话（下次请求自动轮询重绑）。
+  - 账号用 token 掩码做稳定标识，`accounts.txt` 重排/增删行后仍能正确 remap（新增 `AccountPool.FindByMask`）。
+- **会话死亡自愈**（跟随 `PERSIST_SESSIONS` 开关，`handlers/handler.go` `shouldSelfHeal`）：缓存/恢复的会话若以**非鉴权错误**（404/5xx/网络——即「上游会话大概率已死」）失败，在同账号重建会话 + 全量历史重放 + 本请求内重试一次（仅非流式请求；401/403 仍走隔离+跨账号迁移，429 仍走退避）。
+- 补全执行路径重构为 `buildAndComplete` 闭包，使自愈可复用同一套 prompt/图片/限流/重试逻辑（`errRequestAborted` 哨兵排除请求本身的错误，不触发自愈）。
+
 
 

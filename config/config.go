@@ -40,6 +40,8 @@ type Config struct {
 	ToolJSONFallback          bool          // sniff unmarked bare JSON as tool calls (double-criteria; default false)
 	ReasoningFallback         bool          // when the reply body is empty but the thinking block holds the answer, promote it to content (default true)
 	ConvFingerprintRoute      bool          // route conversations by their opening fingerprint; first turns start a fresh session on the next round-robin account (default false)
+	PersistSessions          bool          // persist the conversation index to a local data file so tasks survive a restart (default false)
+	DataDir                  string        // data folder for persisted state; default <LOG_FILE dir>/../data, else ./data
 }
 
 // Load reads configuration from the environment. Accounts come from
@@ -80,6 +82,7 @@ func Load() (*Config, error) {
 		ToolJSONFallback:          parseBoolEnv("TOOL_JSON_FALLBACK", false),
 		ReasoningFallback:         parseBoolEnv("REASONING_FALLBACK", true),
 		ConvFingerprintRoute:      parseBoolEnv("CONV_FINGERPRINT_ROUTE", false),
+		PersistSessions:           parseBoolEnv("PERSIST_SESSIONS", false),
 	}
 	if cfg.ProxyAPIKey == "" {
 		return nil, fmt.Errorf("PROXY_API_KEY is required")
@@ -118,6 +121,17 @@ func Load() (*Config, error) {
 		} else {
 			cfg.HealthLogFile = "deepseek-health.log"
 		}
+	}
+
+	// Keep the data folder (persisted session index) one level beside the log
+	// folder: LOG_FILE=/app/logs/app.log → /app/data. Bare deployments
+	// (stdout logging) default to ./data next to the working directory.
+	if d := strings.TrimSpace(os.Getenv("DATA_DIR")); d != "" {
+		cfg.DataDir = d
+	} else if cfg.LogFile != "" {
+		cfg.DataDir = filepath.Join(filepath.Dir(cfg.LogFile), "..", "data")
+	} else {
+		cfg.DataDir = "data"
 	}
 	return cfg, nil
 }

@@ -147,6 +147,8 @@ PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' docker compose u
 | `TOOL_JSON_FALLBACK` | `false` | 裸 JSON 工具调用嗅探（双判据：工具名在白名单 且 带 arguments 键），opt-in |
 | `REASONING_FALLBACK` | `true` | 正文为空而思考块有内容时，把思考内容补进正文 |
 | `CONV_FINGERPRINT_ROUTE` | `false` | 按任务指纹路由：新任务第一回合必建网页会话并轮询下一账号；进行中的任务按「系统+首条指令+首轮回复」指纹回到本任务会话/账号 |
+| `PERSIST_SESSIONS` | `false` | 把会话索引快照到本地 data 目录，重启后自动恢复进行中的任务（同会话同账号） |
+| `DATA_DIR` | 日志同层 `data/` | 持久化文件目录（`<DATA_DIR>/conversations.json`）；留空默认日志文件夹同层的 data 目录 |
 
 ## 多轮对话
 
@@ -154,6 +156,7 @@ PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' docker compose u
 - **直通模式**：响应带非标准字段 `conversation_id`（DeepSeek 会话 ID）；后续请求带上它即可复用该会话（仅取最后一条 user 消息作为 prompt）。
 - **任务级账号分发**（`CONV_FINGERPRINT_ROUTE`，默认关）：多任务并发时每个任务用自己的网页会话，新任务轮询到下一个账号，风控负载按任务数摊薄；开启后「无 assistant 历史」的请求不再走最近会话兜底（每次新建会话）。
 - **账号轮询修复**：此前未绑定的新会话静默钉在第一个账号（轮询实际失效，仅在被隔离账号后才换号），现已在所有存活账号间真正轮询。
+- **会话持久化**（`PERSIST_SESSIONS`，默认关）：开启后把「前缀键 / 指纹键 / 会话ID → 会话记录（含所属账号）」快照到 `<DATA_DIR>/conversations.json`（默认日志同层 `data/` 目录）。服务重启后自动恢复——任务 a 继续命中同一网页会话与同一账号 A，不需要从头重放上下文；已超空闲 TTL 或账号已失效的会话在恢复时自动丢弃。写入 5 秒节流 + 原子替换，关机前强制 flush；另在缓存会话出现「疑似上游会话死亡」（非 401/403/429 的失败）时自动在同账号重建会话并重试一次（仅非流式请求）。
 
 > 冷启动说明：服务重启后，若历史超过一轮，只会带上 system 提示词与最后一条用户消息。
 

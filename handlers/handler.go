@@ -114,7 +114,10 @@ type Handler struct {
 	// health is optional; when set, 401/403 in the request path quarantine
 	// the offending account and are recorded in the health log file.
 	health *HealthChecker
-	mu     sync.Mutex // protects lastRequestAt
+	// persister is optional; when set, the conversation index is snapshotted
+	// to the local data file (PERSIST_SESSIONS) so tasks survive a restart.
+	persister *ConvPersister
+	mu        sync.Mutex // protects lastRequestAt
 	// lastRequestAt tracks the time of the last request per client pointer,
 	// enforcing a cooldown to simulate a human reading the reply.
 	lastRequestAt map[*deepseek.Client]time.Time
@@ -158,6 +161,34 @@ func New(cfg *config.Config, pool *AccountPool, convs *ConvStore) *Handler {
 // quarantine accounts that fail upstream auth checks.
 func (h *Handler) SetHealthChecker(hc *HealthChecker) {
 	h.health = hc
+}
+
+// SetPersister attaches the optional conversation persister used to snapshot
+// the session index to disk (PERSIST_SESSIONS).
+func (h *Handler) SetPersister(p *ConvPersister) {
+	h.persister = p
+}
+
+// persistMark requests a throttled persistence write. Safe to call from any
+// goroutine, including store-locked paths (the trigger send is non-blocking).
+func (h *Handler) persistMark() {
+	if h.persister != nil {
+		h.persister.Mark()
+	}
+}
+
+// WirePersistence builds the conversation persister for path, loads the
+// on-disk index (restoring tasks that survived the last shutdown), and wires
+// every store removal to a re-persist. Call before serving; Close() the
+// returned persister on shutdown to flush the final snapshot.
+func (h *Handler) WirePersistence(path string) *ConvPersister {
+	p := NewConvPersister(path, h.convs.Snapshot, h.restoreConvRecords)
+	restored, dropped := p.Load()
+	h.SetPersister(p)
+	h.convs.SetRemoveHook(h.persistMark)
+	p.Start()
+	log.Printf("persist: session index %s (restored %d sessions, dropped %d stale entries)", path, restored, dropped)
+	return p
 }
 
 // startDeviceIDRotation periodically rotates DeviceIDs across all accounts
@@ -336,113 +367,6 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	conv.Lock()
 	defer conv.Unlock()
 
-	var prompt string
-	var images []imageRef
-	if useToolPath {
-		// Agent / tool flow. The upstream session already holds everything up to
-		// the last assistant message, so on a cache hit only the newer messages
-		// are sent; a fresh session gets the full history. The tool protocol and
-		// system directives are re-injected on every turn so the model keeps the
-		// format as the session grows.
-		start := 0
-		if !fresh {
-			if la := lastAssistantIndex(req.Messages); la >= 0 {
-				start = la + 1
-			}
-		}
-		if activeTools {
-			if tp := buildToolPrompt(tools, choice); tp != "" {
-				systemParts = append(systemParts, tp)
-			}
-		}
-		if isJSONMode(req.ResponseFormat) {
-			systemParts = append(systemParts, "Reply with ONLY a valid JSON object. No extra text, no markdown.")
-		}
-		if len(systemParts) > 0 {
-			prompt = "[System]\n" + strings.Join(systemParts, "\n\n") + "\n[/System]"
-		}
-		var lines []string
-		for _, msg := range req.Messages[start:] {
-			switch msg.Role {
-			case "system", "developer":
-				// already collected into systemParts above
-			case "user":
-				if text := contentText(msg.Content); text != "" {
-					lines = append(lines, text)
-				}
-				images = append(images, extractImages(msg.Content)...)
-			case "assistant":
-				if s := renderToolCallsSentinel(msg.ToolCalls); s != "" {
-					lines = append(lines, s)
-				}
-				if text := contentText(msg.Content); text != "" {
-					lines = append(lines, text)
-				}
-			case "tool":
-				lines = append(lines, "[Tool Result id="+msg.ToolCallID+"]: "+contentText(msg.Content))
-			}
-		}
-		if len(lines) > 0 {
-			prompt += "\n\n" + strings.Join(lines, "\n")
-		}
-		if strings.TrimSpace(prompt) == "" {
-			writeError(w, http.StatusBadRequest, "invalid_request_error", "messages carry no content to send")
-			return
-		}
-	} else {
-		// Plain chat path (unchanged): only the last user message is new input.
-		var lastUserText string
-		var lastUserImages []imageRef
-		hasUser := false
-		for _, msg := range req.Messages {
-			if msg.Role != "user" {
-				continue
-			}
-			hasUser = true
-			lastUserText = contentText(msg.Content)
-			lastUserImages = extractImages(msg.Content)
-		}
-		if !hasUser || (strings.TrimSpace(lastUserText) == "" && len(lastUserImages) == 0) {
-			writeError(w, http.StatusBadRequest, "invalid_request_error", "messages must contain a user message with text or images")
-			return
-		}
-		prompt = lastUserText
-		images = lastUserImages
-		if fresh && len(systemParts) > 0 {
-			prompt = "[System]\n" + strings.Join(systemParts, "\n\n") + "\n[/System]\n\n" + prompt
-		}
-	}
-
-	// Images ride along as uploaded files referenced by ref_file_ids. Only the
-	// current turn's images are sent; older ones are already in the upstream
-	// session context.
-	var refFileIDs []string
-	if len(images) > 0 {
-		ids, err := uploadImages(r.Context(), conv.Client, images)
-		if err != nil {
-			log.Printf("chat: image upload failed: %v", err)
-			writeError(w, http.StatusBadGateway, "api_error", "image upload failed: "+err.Error())
-			return
-		}
-		refFileIDs = ids
-	}
-
-	input := deepseek.CompletionInput{
-		SessionID:       conv.SessionID,
-		ThinkingEnabled: m.Thinking,
-		SearchEnabled:   m.Search,
-		Prompt:          prompt,
-		RefFileIDs:      refFileIDs,
-	}
-	if conv.HasParent {
-		parent := conv.ParentID
-		input.ParentMessageID = &parent
-		input.ModelType = nil
-	} else {
-		defaultModel := "default"
-		input.ModelType = &defaultModel
-	}
-
 	completionID := "chatcmpl-" + randHex(16)
 	createdAt := time.Now().Unix()
 
@@ -493,6 +417,132 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
+	// buildAndComplete builds this turn's prompt / images / input for the
+	// given conversation and runs the upstream completion with 429 retries.
+	// It is a closure so the session self-heal path below can rerun it on a
+	// freshly recreated session with full history replay. Pre-completion
+	// aborts (invalid request, image upload failure, client gone) return
+	// errRequestAborted and never trigger self-heal.
+	buildAndComplete := func(c *Conversation, isFresh bool) error {
+		var prompt string
+		var images []imageRef
+		if useToolPath {
+			// Agent / tool flow. The upstream session already holds everything
+			// up to the last assistant message, so on a cache hit only the
+			// newer messages are sent; a fresh session gets the full history.
+			// The tool protocol and system directives are re-injected on every
+			// turn so the model keeps the format as the session grows.
+			start := 0
+			if !isFresh {
+				if la := lastAssistantIndex(req.Messages); la >= 0 {
+					start = la + 1
+				}
+			}
+			if activeTools {
+				if tp := buildToolPrompt(tools, choice); tp != "" {
+					systemParts = append(systemParts, tp)
+				}
+			}
+			if isJSONMode(req.ResponseFormat) {
+				systemParts = append(systemParts, "Reply with ONLY a valid JSON object. No extra text, no markdown.")
+			}
+			if len(systemParts) > 0 {
+				prompt = "[System]\n" + strings.Join(systemParts, "\n\n") + "\n[/System]"
+			}
+			var lines []string
+			for _, msg := range req.Messages[start:] {
+				switch msg.Role {
+				case "system", "developer":
+					// already collected into systemParts above
+				case "user":
+					if text := contentText(msg.Content); text != "" {
+						lines = append(lines, text)
+					}
+					images = append(images, extractImages(msg.Content)...)
+				case "assistant":
+					if s := renderToolCallsSentinel(msg.ToolCalls); s != "" {
+						lines = append(lines, s)
+					}
+					if text := contentText(msg.Content); text != "" {
+						lines = append(lines, text)
+					}
+				case "tool":
+					lines = append(lines, "[Tool Result id="+msg.ToolCallID+"]: "+contentText(msg.Content))
+				}
+			}
+			if len(lines) > 0 {
+				prompt += "\n\n" + strings.Join(lines, "\n")
+			}
+			if strings.TrimSpace(prompt) == "" {
+				writeError(w, http.StatusBadRequest, "invalid_request_error", "messages carry no content to send")
+				return errRequestAborted
+			}
+		} else {
+			// Plain chat path (unchanged): only the last user message is new input.
+			var lastUserText string
+			var lastUserImages []imageRef
+			hasUser := false
+			for _, msg := range req.Messages {
+				if msg.Role != "user" {
+					continue
+				}
+				hasUser = true
+				lastUserText = contentText(msg.Content)
+				lastUserImages = extractImages(msg.Content)
+			}
+			if !hasUser || (strings.TrimSpace(lastUserText) == "" && len(lastUserImages) == 0) {
+				writeError(w, http.StatusBadRequest, "invalid_request_error", "messages must contain a user message with text or images")
+				return errRequestAborted
+			}
+			prompt = lastUserText
+			images = lastUserImages
+			if isFresh && len(systemParts) > 0 {
+				prompt = "[System]\n" + strings.Join(systemParts, "\n\n") + "\n[/System]\n\n" + prompt
+			}
+		}
+
+		// Images ride along as uploaded files referenced by ref_file_ids. Only
+		// the current turn's images are sent; older ones are already in the
+		// upstream session context.
+		var refFileIDs []string
+		if len(images) > 0 {
+			ids, err := uploadImages(r.Context(), c.Client, images)
+			if err != nil {
+				log.Printf("chat: image upload failed: %v", err)
+				writeError(w, http.StatusBadGateway, "api_error", "image upload failed: "+err.Error())
+				return errRequestAborted
+			}
+			refFileIDs = ids
+		}
+
+		input := deepseek.CompletionInput{
+			SessionID:       c.SessionID,
+			ThinkingEnabled: m.Thinking,
+			SearchEnabled:   m.Search,
+			Prompt:          prompt,
+			RefFileIDs:      refFileIDs,
+		}
+		if c.HasParent {
+			parent := c.ParentID
+			input.ParentMessageID = &parent
+			input.ModelType = nil
+		} else {
+			defaultModel := "default"
+			input.ModelType = &defaultModel
+		}
+
+		// Rate-limit per-account to stay under DeepSeek's anti-fraud
+		// thresholds. Blocks until a quota token and a concurrency slot are
+		// both available. Also enforces a minimum cooldown between requests
+		// to the same account (simulates a human reading the reply before
+		// asking the next question).
+		h.enforceReadTimeCooldown(c.Client, toolFlow)
+		release := h.limiter.Wait(c.Client.DeviceID, h.cfg.AccountQPM, h.cfg.MaxConcurrentPerAccount)
+		defer release()
+
+		return h.chatWithRetry(r.Context(), c, input, cb)
+	}
+
 	if req.Stream {
 		stream = newSSEWriter(w, completionID, modelName, createdAt, conv.SessionID)
 		if err := stream.open(); err != nil {
@@ -501,15 +551,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Rate-limit per-account to stay under DeepSeek's anti-fraud thresholds.
-	// Blocks until a quota token and concurrency slot are both available.
-	// Also enforces a minimum cooldown between requests to the same account
-	// (simulates a human reading the reply before asking the next question).
-	h.enforceReadTimeCooldown(conv.Client, toolFlow)
-	release := h.limiter.Wait(conv.Client.DeviceID, h.cfg.AccountQPM, h.cfg.MaxConcurrentPerAccount)
-	defer release()
-
-	err = h.chatWithRetry(r.Context(), conv, input, cb)
+	err = buildAndComplete(conv, fresh)
 
 	// Passive detection: an upstream auth failure observed mid-request
 	// quarantines the account immediately so the next request migrates off
@@ -527,6 +569,34 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 					h.pool.Quarantine(idx, reason)
 				}
 			}
+		}
+	}
+
+	// Session self-heal (PERSIST_SESSIONS, non-streaming only): a cached or
+	// restored upstream session may be dead — e.g. it expired upstream while
+	// the proxy was restarting. Recreate the session on the same account
+	// (full history replay) and retry the completion once. Auth failures
+	// stay on the quarantine/migration path; 429s are rate limits, not dead
+	// sessions; pre-completion aborts never retry.
+	if shouldSelfHeal(err, req.Stream, h.cfg.PersistSessions, fresh, r.Context().Err() != nil) {
+		log.Printf("chat: cached session %s looks dead (%v); recreating on the same account and retrying once", conv.SessionID[:8], err)
+		h.convs.Evict(conv.SessionID)
+		key := PrefixKey(req.Messages[:len(req.Messages)-1], m.ID)
+		nc, cerr := h.coalesceOrCreate(key, m.ID)
+		if cerr != nil {
+			log.Printf("chat: self-heal session create failed: %v", cerr)
+		} else {
+			conv, fresh = nc, true
+			// Reset the per-response state so the failed first attempt
+			// (partial text, stale detector, usage baseline) cannot
+			// contaminate the retry.
+			reply.Reset()
+			thinking.Reset()
+			usageTotal = -1
+			emittedCalls = nil
+			detector = newStreamingToolDetector(tools, !activeTools, h.cfg.ToolJSONFallback)
+			h.persistMark()
+			err = buildAndComplete(conv, true)
 		}
 	}
 
@@ -591,6 +661,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 		full := append(append([]chatMessage{}, req.Messages...), nextMsg)
 		h.convs.RegisterFingerprint(convFingerprint(full, m.ID), conv)
 	}
+	h.persistMark()
 
 	if err != nil {
 		if r.Context().Err() != nil {
@@ -770,6 +841,78 @@ func (h *Handler) migrateOffDeadAccount(req *chatRequest, m *ModelInfo, toolLoop
 	return conv, fresh, nil
 }
 
+// restoreConvRecords rebuilds in-memory state from persisted session records
+// (called at startup, before the server listens). Drops, counted, are:
+// records past their idle TTL (the sweep already deleted those upstream
+// sessions) and records whose account no longer exists or is quarantined
+// (its web sessions died with the token; the next request rebinds via
+// round-robin). Restored tasks keep their prefix→account binding, so task a
+// resumes on account A after a restart.
+func (h *Handler) restoreConvRecords(entries map[string]ConvRecord) (restored, dropped int) {
+	if len(entries) == 0 {
+		return 0, 0
+	}
+	now := time.Now().Unix()
+	bySession := make(map[string]*Conversation, len(entries))
+	prefixKeys := make(map[string]string)
+	fingerprintKeys := make(map[string]string)
+	for _, rec := range entries {
+		if rec.SessionID == "" {
+			dropped++
+			continue
+		}
+		if rec.Expiry > 0 && now > rec.Expiry {
+			dropped++
+			continue
+		}
+		idx := h.pool.FindByMask(rec.Account)
+		if idx < 0 {
+			dropped++
+			continue
+		}
+		if conv, ok := bySession[rec.SessionID]; !ok {
+			conv = &Conversation{
+				Client:    h.pool.clients[idx],
+				SessionID: rec.SessionID,
+				ModelID:   rec.Model,
+				Turn:      rec.Turns,
+				turnCount: rec.Turns,
+			}
+			if rec.LastUsed > 0 {
+				conv.LastUsed = time.Unix(rec.LastUsed, 0)
+			} else {
+				conv.LastUsed = time.Now()
+			}
+			if rec.Expiry > 0 {
+				conv.ttl = time.Until(time.Unix(rec.Expiry, 0))
+			}
+			bySession[rec.SessionID] = conv
+		}
+		for _, k := range rec.PrefixKeys {
+			prefixKeys[k] = rec.SessionID
+		}
+		for _, k := range rec.FingerprintKeys {
+			fingerprintKeys[k] = rec.SessionID
+		}
+	}
+	restored = h.convs.LoadSnapshot(bySession, prefixKeys, fingerprintKeys)
+
+	// Restore the prefix→account bindings so restored tasks stay on their
+	// accounts (the whole point of persistence in multi-account setups).
+	h.pendingMu.Lock()
+	for k, sid := range prefixKeys {
+		conv := bySession[sid]
+		if conv == nil {
+			continue
+		}
+		if idx := h.pool.IndexOf(conv.Client); idx >= 0 {
+			h.prefixToClientIdx[k] = idx
+		}
+	}
+	h.pendingMu.Unlock()
+	return restored, dropped
+}
+
 // resolveBoundAccount returns the pool index serving the prefix. Existing
 // bindings are kept; unbound prefixes and bindings pointing at quarantined
 // accounts take the next live account in round-robin order. The caller must
@@ -894,6 +1037,34 @@ func (h *Handler) buildUsage(conv *Conversation, total int64, replyChars int) ma
 		"completion_tokens": int(completion),
 		"total_tokens":      int(span),
 	}
+}
+
+// errRequestAborted signals a pre-completion abort (invalid request, image
+// upload failure, client gone). Self-heal never recreates a session for
+// these — the request itself is the problem, not the upstream session.
+var errRequestAborted = errors.New("request aborted before completion")
+
+// shouldSelfHeal decides whether a failed completion on a cached (or
+// restored) upstream session warrants recreating the session on the same
+// account — full history replay — and retrying once.
+//
+// It refuses to fire for: success, streaming responses (the client has
+// already received partial deltas), disabled persistence, fresh sessions
+// (there is nothing cached to have died), aborted requests (client gone),
+// and auth/rate-limit API errors (401/403 → quarantine+migrate; 429 →
+// backoff, not a dead session).
+func shouldSelfHeal(err error, stream, enabled, isFresh, clientGone bool) bool {
+	if err == nil || stream || !enabled || isFresh || clientGone {
+		return false
+	}
+	if errors.Is(err, errRequestAborted) {
+		return false
+	}
+	var ae *deepseek.APIError
+	if errors.As(err, &ae) && (ae.HTTPStatus == 401 || ae.HTTPStatus == 403 || ae.HTTPStatus == 429) {
+		return false
+	}
+	return true
 }
 
 func mapUpstreamError(err error) (int, string) {

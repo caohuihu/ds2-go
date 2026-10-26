@@ -168,6 +168,8 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | `TOOL_JSON_FALLBACK` | `false` | Sniff unmarked bare JSON as tool calls (double criterion: name in whitelist AND has arguments); opt-in |
 | `REASONING_FALLBACK` | `true` | Promote thinking text to content when the reply body is empty |
 | `CONV_FINGERPRINT_ROUTE` | `false` | Route by conversation-opening fingerprint: first turn of a new task gets a fresh session on the next round-robin account; in-progress tasks re-attach to their own session/account |
+| `PERSIST_SESSIONS` | `false` | Snapshot the conversation index to a local data dir so in-progress tasks resume (same session + account) after a restart |
+| `DATA_DIR` | `data/` beside the log dir | Directory for the persisted session index (`<DATA_DIR>/conversations.json`); empty = the `data/` folder one level beside the log folder |
 
 ## Multi-turn conversations
 
@@ -187,6 +189,17 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 - **Round-robin fix.** Unbound prefixes previously resolved to account 0
   (Go's map zero value), pinning every new session to the first account; new
   sessions now genuinely rotate across all live accounts.
+- **Session persistence** (`PERSIST_SESSIONS`, default off). When on, the
+  "prefix / fingerprint / session-id → session record (incl. owning account)"
+  index is snapshotted to `<DATA_DIR>/conversations.json` (default: the `data/`
+  folder one level beside the log dir). On restart it is restored so task a
+  keeps hitting the same web session and the same account A — no context
+  replay. Entries whose idle TTL has lapsed, or whose account is gone or
+  quarantined, are dropped at load. Writes are throttled (5 s) and atomic;
+  a final flush happens on shutdown. Additionally, a cached session that
+  fails with a non-auth error (404/5xx/network — "the upstream session is
+  probably dead") is self-healed by recreating the session on the same
+  account and retrying once (non-streaming requests only).
 
 > Cold start note: after a restart, if the history has more than one turn, only
 > the system prompt and the latest user message are replayed. This is a
