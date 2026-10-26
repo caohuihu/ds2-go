@@ -37,8 +37,23 @@ services:
       - LOG_FILE=${LOG_FILE:-}
       # 检测日志文件（可选，留空默认与 LOG_FILE 同目录：/app/logs/deepseek-health.log）
       - HEALTH_LOG_FILE=${HEALTH_LOG_FILE:-}
+      # 账号健康检测（token 失效探测）
+      - STARTUP_ACCOUNT_CHECK=${STARTUP_ACCOUNT_CHECK:-true}
+      - HEALTH_PROBE_INTERVAL=${HEALTH_PROBE_INTERVAL:-30m}
+      - HEALTH_PROBE_DEAD_RETRY=${HEALTH_PROBE_DEAD_RETRY:-10m}
+      # 工具调用解析 / 思考兜底
+      - TOOL_JSON_FALLBACK=${TOOL_JSON_FALLBACK:-false}
+      - REASONING_FALLBACK=${REASONING_FALLBACK:-true}
+      # 任务级账号分发：任务a→账号A、任务b→账号B（默认关）
+      - CONV_FINGERPRINT_ROUTE=${CONV_FINGERPRINT_ROUTE:-false}
+      # 会话持久化：重启后恢复进行中的任务（同会话同账号，默认关；需挂载 ./data）
+      - PERSIST_SESSIONS=${PERSIST_SESSIONS:-false}
+      # 数据目录（留空 = 日志目录同层的 data/；容器内默认 /app/data）
+      - DATA_DIR=${DATA_DIR:-}
     volumes:
       - ./accounts.txt:/app/accounts.txt:ro
       # 日志文件（可选，设置 LOG_FILE 后生效）
       - ./logs:/app/logs
+      # 会话持久化数据（PERSIST_SESSIONS=true 时生效；不挂载则容器重建后丢失）
+      - ./data:/app/data
     restart: unless-stopped
