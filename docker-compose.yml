@@ -48,6 +48,11 @@ services:
       - DAILY_REQUEST_LIMIT=${DAILY_REQUEST_LIMIT:-0}
       # 拟人长停顿：每个请求有该概率额外随机等待 20–60s（0=关）
       - LONG_PAUSE_CHANCE=${LONG_PAUSE_CHANCE:-0}
+      # 静默自动续写：上游空回复时同会话自动发 "Continue"（false=关；MAX=最多连续次数）
+      - AUTO_CONTINUATION=${AUTO_CONTINUATION:-false}
+      - AUTO_CONTINUATION_MAX=${AUTO_CONTINUATION_MAX:-2}
+      # 风控可观测：按间隔输出每账号风控摘要到主日志（0=关）
+      - RISK_STATS_INTERVAL=${RISK_STATS_INTERVAL:-0}
       # 工具调用解析 / 思考兜底
       - TOOL_JSON_FALLBACK=${TOOL_JSON_FALLBACK:-false}
       - REASONING_FALLBACK=${REASONING_FALLBACK:-true}

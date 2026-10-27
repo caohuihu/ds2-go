@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Silent-reply auto-continuation** (`handlers/handler.go`, `config/config.go`)
+  - New env `AUTO_CONTINUATION` (default `false`) + `AUTO_CONTINUATION_MAX`
+    (default `2`): when the upstream returns a *silent* successful completion
+    (empty body, empty thinking — the long-task stall mode), the proxy nudges
+    the **same web session** with a "Continue" prompt chained off the empty
+    reply's parent message, up to `AUTO_CONTINUATION_MAX` consecutive nudges.
+    Continuation deltas flow into the same reply stream, so the client sees
+    one seamless answer; a failed nudge logs and returns the partial reply.
+    Triggers only when the reply is fully empty AND the session has a parent
+    message; tool-flow turns and any non-empty reply never trigger it.
+    Continuation turns count toward `REQUESTS_PER_SESSION` and the daily
+    quota (no exemption).
+- **Risk observability** (`handlers/stats.go`, `handlers/health.go`)
+  - New env `RISK_STATS_INTERVAL` (duration, default `0` = off): a ticker in
+    `main` logs a multi-line risk summary to the main log at that interval —
+    global request / session-created / cache-hit counters plus, per account,
+    successful completions, consecutive-429 count, remaining 429 cooldown,
+    remaining BAN hold, daily-quota usage and in-flight count
+    (`AccountPool.RateHits` exposes the escalation counter; the created-vs-
+    hits ratio is the primary risk signal).
+
 - **Daily request quota** (`handlers/usage.go`, `config/config.go`)
   - New env `DAILY_REQUEST_LIMIT` (default `0` = unlimited): per-account
     requests are counted per local day and persisted to

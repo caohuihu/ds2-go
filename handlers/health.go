@@ -191,6 +191,18 @@ func (p *AccountPool) MarkRateRecovery(idx int) {
 	p.mu.Unlock()
 }
 
+// RateHits returns the account's current consecutive-429 escalation count
+// (0 after a success cleared it). It is what MarkRateLimited escalates from
+// and the risk summary reports; read under the pool mutex.
+func (p *AccountPool) RateHits(idx int) int {
+	if idx < 0 || idx >= len(p.clients) {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.rateHits[idx]
+}
+
 // CoolingLeft returns the remaining 429 cooldown of the account (0 = none).
 func (p *AccountPool) CoolingLeft(idx int) time.Duration {
 	if idx < 0 || idx >= len(p.clients) {

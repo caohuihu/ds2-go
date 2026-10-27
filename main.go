@@ -89,6 +89,25 @@ func main() {
 	defer stopSweep()
 	go convs.SweepLoop(sweepCtx)
 
+	// Risk observability (RISK_STATS_INTERVAL): periodic per-account risk
+	// summary in the main log; stops with the rest of the shutdown sequence.
+	if cfg.RiskStatsInterval > 0 {
+		statsCtx, stopStats := context.WithCancel(context.Background())
+		defer stopStats()
+		go func() {
+			ticker := time.NewTicker(cfg.RiskStatsInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					h.LogRiskStats()
+				case <-statsCtx.Done():
+					return
+				}
+			}
+		}()
+	}
+
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           mux,
@@ -140,6 +159,12 @@ func main() {
 		}
 		if cfg.LongPauseChance > 0 {
 			log.Printf("  human-like long pause  : %.0f%% of requests wait an extra 20–60s (agent loops exempt)", cfg.LongPauseChance*100)
+		}
+		if cfg.AutoContinuation {
+			log.Printf("  auto-continuation      : ON (up to %d \"continue\" nudges per silent reply)", cfg.AutoContinuationMax)
+		}
+		if cfg.RiskStatsInterval > 0 {
+			log.Printf("  risk stats log         : per-account summary every %s", cfg.RiskStatsInterval)
 		}
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %v", err)

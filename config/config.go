@@ -40,6 +40,9 @@ type Config struct {
 	BanQuarantineHours      int           // how long to hold a BAN-detected account (0 = hold until a probe succeeds, default 168 = 7d)
 	DailyRequestLimit       int           // per-account daily request quota (0 = unlimited, default 0)
 	LongPauseChance         float64       // chance that a request waits an extra 20–60s human-like pause (0 = off, default 0)
+	AutoContinuation        bool          // nudge silent empty upstream replies with a "continue" turn in the same session (default false)
+	AutoContinuationMax     int           // max continuation rounds per request (default 2)
+	RiskStatsInterval       time.Duration // log a per-account risk summary this often (0 = off, default 0)
 	HealthLogFile           string        // dedicated token-health log file; empty = events go to main log only
 	StartupAccountCheck     bool          // probe all accounts once before serving (default true)
 	ToolJSONFallback        bool          // sniff unmarked bare JSON as tool calls (double-criteria; default false)
@@ -86,6 +89,9 @@ func Load() (*Config, error) {
 		BanQuarantineHours:      parseIntEnv("BAN_QUARANTINE_HOURS", 168),
 		DailyRequestLimit:       parseIntEnv("DAILY_REQUEST_LIMIT", 0),
 		LongPauseChance:         parseFloatEnv("LONG_PAUSE_CHANCE", 0),
+		AutoContinuation:        parseBoolEnv("AUTO_CONTINUATION", false),
+		AutoContinuationMax:     parseIntEnv("AUTO_CONTINUATION_MAX", 2),
+		RiskStatsInterval:       parseDurationEnv("RISK_STATS_INTERVAL", 0),
 		HealthLogFile:           env("HEALTH_LOG_FILE", ""),
 		StartupAccountCheck:     parseBoolEnv("STARTUP_ACCOUNT_CHECK", true),
 		ToolJSONFallback:        parseBoolEnv("TOOL_JSON_FALLBACK", false),

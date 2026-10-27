@@ -169,6 +169,9 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | `BAN_QUARANTINE_HOURS` | `168` | Hold window for a BAN-detected account (0 = hold until a probe succeeds). 429 account-level backoff is built in, needs no config |
 | `DAILY_REQUEST_LIMIT` | `0` | Per-account daily request budget (resets by local date, counters persisted across restarts); 0 = unlimited. When every account is spent, new sessions 503 until midnight; cached sessions are unaffected |
 | `LONG_PAUSE_CHANCE` | `0` | Per-request probability of an extra 20–60s human-like pause (agent tool loops are exempt); 0 = off |
+| `AUTO_CONTINUATION` | `false` | Nudge a silent empty upstream reply (no body, no thinking) with a "Continue" prompt on the same web session, up to `AUTO_CONTINUATION_MAX` consecutive nudges; continuation turns count toward the session turn cap and the daily quota |
+| `AUTO_CONTINUATION_MAX` | `2` | Max "Continue" nudges per request (only when `AUTO_CONTINUATION=true`) |
+| `RISK_STATS_INTERVAL` | `0` | Log a per-account risk summary at this interval (global requests / sessions created / cache hits, plus per-account completions, consecutive 429s, cooldown & BAN remaining, daily quota, in-flight); 0 = off |
 | `TOOL_JSON_FALLBACK` | `false` | Sniff unmarked bare JSON as tool calls (double criterion: name in whitelist AND has arguments); opt-in |
 | `REASONING_FALLBACK` | `true` | Promote thinking text to content when the reply body is empty |
 | `CONV_FINGERPRINT_ROUTE` | `false` | Route by conversation-opening fingerprint: first turn of a new task gets a fresh session on the next round-robin account; in-progress tasks re-attach to their own session/account |
@@ -208,6 +211,21 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
   20–60 s before hitting upstream — a "stepped away" long tail on top of the
   5–30 s read-time cooldown, making the per-account request rhythm harder
   to fingerprint as machine-paced.
+- **Silent-reply auto-continuation** (`AUTO_CONTINUATION`, default off).
+  The upstream occasionally returns a *silent* successful completion
+  (empty body, empty thinking) — the classic long-task stall mode. When
+  enabled, the proxy nudges the **same web session** with a "Continue"
+  prompt chained off the empty reply, up to `AUTO_CONTINUATION_MAX`
+  consecutive nudges; the continuation's deltas flow into the same reply
+  stream, so the client sees one seamless answer. Continuation turns count
+  toward `REQUESTS_PER_SESSION` and the daily quota; tool-flow turns and
+  replies with any content never trigger it.
+- **Risk observability** (`RISK_STATS_INTERVAL`, default off). At that
+  interval the main log gets a risk summary: global request / session-created
+  / cache-hit counters, plus per-account successful completions,
+  consecutive-429 count, cooldown & BAN-hold remaining, daily-quota usage
+  and in-flight count. The created-vs-hits ratio is the primary risk signal —
+  new sessions are the expensive, fingerprintable upstream action.
 - **Multi-client isolation** (`PROXY_KEYS_FILE`, active with ≥2 keys). Give each
   client a distinct proxy key (e.g. SiYuan uses key 1, opencode uses key 2). The
   key's stable id is mixed into the **prefix and fingerprint keys**, so distinct

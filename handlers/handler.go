@@ -136,6 +136,9 @@ type Handler struct {
 	// request counters are kept (and persisted) so a fresh account rotation
 	// respects each account's daily quota.
 	usage *UsageTracker
+	// stats aggregates the risk-relevant counters; LogRiskStats reports on
+	// them (RISK_STATS_INTERVAL ticker in main).
+	stats *RiskStats
 	mu    sync.Mutex // protects lastRequestAt
 	// lastRequestAt tracks the time of the last request per client pointer,
 	// enforcing a cooldown to simulate a human reading the reply.
@@ -165,6 +168,7 @@ func New(cfg *config.Config, pool *AccountPool, convs *ConvStore) *Handler {
 		pool:              pool,
 		convs:             convs,
 		limiter:           NewAccountLimiter(cfg.AccountQPM),
+		stats:             NewRiskStats(len(pool.clients)),
 		lastRequestAt:     make(map[*deepseek.Client]time.Time),
 		pending:           make(map[string]*pendingEntry),
 		prefixToClientIdx: make(map[string]int),
@@ -424,6 +428,16 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Risk observability: count this request, and whether it had to create a
+	// fresh upstream session (the expensive, fingerprintable action) or
+	// reused a cached/restored one.
+	if how == howCreated {
+		h.stats.RecordSession()
+	} else {
+		h.stats.RecordCacheHit()
+	}
+	h.stats.RecordRequest()
+
 	conv.Lock()
 	defer conv.Unlock()
 
@@ -676,6 +690,32 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 			detector = newStreamingToolDetector(tools, !activeTools, h.cfg.ToolJSONFallback)
 			h.persistMark()
 			err = buildAndComplete(conv, true)
+		}
+	}
+
+	// Auto-continuation (AUTO_CONTINUATION): the upstream occasionally returns
+	// a successful-but-silent completion (empty body, empty thinking) — the
+	// long-task stall mode. Nudge the same session with a "Continue" prompt
+	// chained off the empty reply; its deltas flow into the same stream and
+	// reply builders, so the client sees one seamless answer. Continuation
+	// turns count toward REQUESTS_PER_SESSION and the daily quota. A failed
+	// nudge logs and keeps the partial reply instead of failing the request.
+	if h.cfg.AutoContinuation && h.cfg.AutoContinuationMax > 0 && err == nil {
+		for cont := 1; cont <= h.cfg.AutoContinuationMax && shouldAutoContinue(conv, toolFlow, reply.String(), thinking.String(), emittedCalls); cont++ {
+			log.Printf("chat: silent upstream reply — auto-continuation %d/%d on session %s", cont, h.cfg.AutoContinuationMax, conv.SessionID)
+			parent := conv.ParentID
+			kin := deepseek.CompletionInput{
+				SessionID:       conv.SessionID,
+				ParentMessageID: &parent,
+				ModelType:       nil, // continuation, not the session's first turn
+				Prompt:          "Continue",
+			}
+			h.enforceReadTimeCooldown(conv.Client, toolFlow)
+			cRelease := h.limiter.Wait(conv.Client.DeviceID, h.cfg.AccountQPM, h.cfg.MaxConcurrentPerAccount)
+			if cerr := h.chatWithRetry(r.Context(), conv, kin, cb); cerr != nil {
+				log.Printf("chat: auto-continuation %d/%d failed: %v (returning partial reply)", cont, h.cfg.AutoContinuationMax, cerr)
+			}
+			cRelease()
 		}
 	}
 
@@ -1195,6 +1235,18 @@ func shouldSelfHeal(err error, stream, enabled, isFresh, clientGone bool) bool {
 	return true
 }
 
+// shouldAutoContinue reports whether a "Continue" nudge should be sent on the
+// same session: the reply so far is fully empty (no body, no thinking, no
+// tool calls), it is not a tool-flow turn (empty content is the normal shape
+// there), and the session already has a parent message to chain off. The
+// caller gates on cfg.AutoContinuation / AutoContinuationMax / overall
+// success separately.
+func shouldAutoContinue(conv *Conversation, toolFlow bool, reply, thinking string, emittedCalls []ToolCall) bool {
+	return conv != nil && conv.HasParent && !toolFlow &&
+		len(emittedCalls) == 0 &&
+		strings.TrimSpace(reply) == "" && strings.TrimSpace(thinking) == ""
+}
+
 // banKeywords are upstream error wordings that signal an account ban rather
 // than a token expiry or a transient fault. Matched only on the error path
 // (API error messages), never on model reply content.
@@ -1267,6 +1319,7 @@ func (h *Handler) chatWithRetry(ctx context.Context, conv *Conversation, input d
 		lastErr = h.doCompletionWithRetry(ctx, conv.Client, input, cb, baseDelay, attempt)
 		if lastErr == nil {
 			h.pool.MarkRateRecovery(idx)
+			h.stats.RecordCompletion(idx)
 			return nil
 		}
 		var ae *deepseek.APIError

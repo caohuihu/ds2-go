@@ -4,6 +4,11 @@
 
 ## [未发布]
 
+### 静默自动续写 + 风控可观测（参考 webai2api）
+
+- **静默自动续写**（`AUTO_CONTINUATION` + `AUTO_CONTINUATION_MAX`，默认 `false` / `2`，`handlers/handler.go` + `config/config.go`）：上游偶尔返回"成功但静默"的空回复（正文、思考全空——长任务静默卡死的典型形态，如 56 轮 stall）。开启后在**同一网页会话**内自动发送 "Continue" 促动（挂接在空回复的 parent 消息上，`ModelType` 置空表示非首轮），最多连续 `AUTO_CONTINUATION_MAX` 次；续写增量流入同一条回复流，客户端看到无缝衔接的答案。仅在回复**完全为空**且会话**已有 parent 消息**时触发，agent 工具流与任何非空回复都不触发；促动失败只记日志并保留已有部分回复，不会让整个请求失败。续写轮**同样计入** `REQUESTS_PER_SESSION` 与日配额（不豁免）。
+- **风控可观测**（`RISK_STATS_INTERVAL`，默认 `0` = 关，`handlers/stats.go` + `handlers/health.go`）：按该间隔（duration）向主日志输出多行风控摘要——全局 请求数 / 新建会话数 / 缓存命中数，以及每账号 成功完成数 / 429 连撞次数（`AccountPool.RateHits` 暴露升级计数）/ 剩余 429 冷却 / 剩余 BAN 保持 / 日配额用量 / 在途数。新建会话 vs 缓存命中的比例是首要风险信号（新建是昂贵且易被指纹识别的动作）。计时器在 `main` 中随关停序列一起取消。
+
 ### 日配额 + 拟人长停顿 + 负载均衡选号（参考 webai2api）
 
 - **日配额**（`DAILY_REQUEST_LIMIT`，默认 `0` = 不限，`handlers/usage.go` + `config/config.go`）：每账号按本地自然日计数请求数，计数落盘到 `<DATA_DIR>/daily-usage.json`（重启不清零、跨天归零、损坏文件隔离不崩溃）。达到配额的账号在新建会话选号时被跳过；全部账号都达标时，新会话请求 503（`errDailyLimit`，午夜后自动恢复），已缓存的会话不受影响。
