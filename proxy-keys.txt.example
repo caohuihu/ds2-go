@@ -1,0 +1,7 @@
+# 多客户端代理密钥示例 —— 复制本文件为 proxy-keys.txt，替换为你自己的 key。
+# 每个客户端（思源 / opencode / 其他 OpenAI 客户端）各用一个不同的 key：
+# 各客户端的 DeepSeek 网页会话会彻底隔离，互不串台。
+# 规则：每行一个 key；# 开头的行和空行忽略；与 PROXY_API_KEY 自动合并去重。
+
+siyuan-2026-改成一个随机长串     # 思源笔记
+opencode-2026-改成一个随机长串    # opencode

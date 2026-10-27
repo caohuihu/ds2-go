@@ -133,7 +133,8 @@ PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' docker compose u
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PORT` | `8080` | 本地 HTTP 服务端口 |
-| `PROXY_API_KEY` | 无，必填 | 客户端调用代理用的密钥 |
+| `PROXY_API_KEY` | 无 | 客户端调用代理用的密钥；可留空改用 `PROXY_KEYS_FILE`。至少 1 个 key（env 或文件） |
+| `PROXY_KEYS_FILE` | `proxy-keys.txt` | 多客户端密钥文件（每行一个 key）。各客户端填不同 key 即可彻底隔离会话，互不串台 |
 | `DEEPSEEK_TOKEN` | 空 | DeepSeek 网页版 `userToken` |
 | `DEEPSEEK_ACCOUNTS_FILE` | `accounts.txt` | 多账号文件，每行一个 token |
 | `DEEPSEEK_BASE_URL` | `https://chat.deepseek.com` | 上游地址 |
@@ -156,6 +157,8 @@ PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' docker compose u
 - **直通模式**：响应带非标准字段 `conversation_id`（DeepSeek 会话 ID）；后续请求带上它即可复用该会话（仅取最后一条 user 消息作为 prompt）。
 - **任务级账号分发**（`CONV_FINGERPRINT_ROUTE`，默认关）：多任务并发时每个任务用自己的网页会话，新任务轮询到下一个账号，风控负载按任务数摊薄；开启后「无 assistant 历史」的请求不再走最近会话兜底（每次新建会话）。
 - **账号轮询修复**：此前未绑定的新会话静默钉在第一个账号（轮询实际失效，仅在被隔离账号后才换号），现已在所有存活账号间真正轮询。
+- **会话持久化**（`PERSIST_SESSIONS`，默认关）：开启后把「前缀键 / 指纹键 / 会话ID → 会话记录（含所属账号）」快照到 `<DATA_DIR>/conversations.json`（默认日志同层 `data/` 目录）。服务重启后自动恢复——任务 a 继续命中同一网页会话与同一账号 A，不需要从头重放上下文；已超空闲 TTL 或账号已失效/被删的会话在恢复时自动丢弃。写入 5 秒节流 + 原子替换，关机前强制 flush；缓存会话出现「疑似上游会话死亡」（非 401/403/429 的失败）时自动在同账号重建会话并重试一次（仅非流式请求）。
+- **多客户端隔离**（`PROXY_KEYS_FILE`，多 key 时自动生效）：每个客户端用**不同的**代理 key（如思源 1 号 key、opencode 2 号 key），该 key 的稳定 ID 会并入**前缀键**与**指纹键**——不同 key 的客户端在内容层就绝不可能共享同一 DeepSeek 网页会话，彻底杜绝"客户端 A 的指令命中客户端 B 的会话"的串台。同一 key 内的不同任务仍按指纹/前缀正常分发到不同账号。
 - **会话持久化**（`PERSIST_SESSIONS`，默认关）：开启后把「前缀键 / 指纹键 / 会话ID → 会话记录（含所属账号）」快照到 `<DATA_DIR>/conversations.json`（默认日志同层 `data/` 目录）。服务重启后自动恢复——任务 a 继续命中同一网页会话与同一账号 A，不需要从头重放上下文；已超空闲 TTL 或账号已失效的会话在恢复时自动丢弃。写入 5 秒节流 + 原子替换，关机前强制 flush；另在缓存会话出现「疑似上游会话死亡」（非 401/403/429 的失败）时自动在同账号重建会话并重试一次（仅非流式请求）。
 
 > 冷启动说明：服务重启后，若历史超过一轮，只会带上 system 提示词与最后一条用户消息。

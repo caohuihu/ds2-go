@@ -11,7 +11,9 @@ import (
 
 type Config struct {
 	Port                      string
-	ProxyAPIKey               string
+	ProxyAPIKey               string   // primary proxy key: PROXY_API_KEY, or the first accepted key when it is empty
+	ProxyKeys                 []string // every accepted proxy API key (PROXY_API_KEY + PROXY_KEYS_FILE)
+	ProxyKeysFile             string   // one proxy API key per line; default proxy-keys.txt
 	BaseURL                   string
 	Accounts                  []string // DeepSeek web tokens, one per account
 	AccountsFile              string
@@ -55,6 +57,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		Port:                      env("PORT", "8080"),
 		ProxyAPIKey:               env("PROXY_API_KEY", ""),
+		ProxyKeysFile:             env("PROXY_KEYS_FILE", "proxy-keys.txt"),
 		BaseURL:                   strings.TrimRight(env("DEEPSEEK_BASE_URL", "https://chat.deepseek.com"), "/"),
 		AccountsFile:              env("DEEPSEEK_ACCOUNTS_FILE", "accounts.txt"),
 		DefaultModel:              env("DEFAULT_MODEL", "deepseek-chat"),
@@ -84,8 +87,38 @@ func Load() (*Config, error) {
 		ConvFingerprintRoute:      parseBoolEnv("CONV_FINGERPRINT_ROUTE", false),
 		PersistSessions:           parseBoolEnv("PERSIST_SESSIONS", false),
 	}
-	if cfg.ProxyAPIKey == "" {
-		return nil, fmt.Errorf("PROXY_API_KEY is required")
+	// Proxy API keys: PROXY_API_KEY (optional) plus one-per-line entries in
+	// PROXY_KEYS_FILE. When PROXY_API_KEY is empty the file is the source of
+	// truth. At least one key is required; the first accepted key is the
+	// "primary" one (kept for compatibility / logging). Each key gets a
+	// stable id that joins the conversation fingerprints, so distinct keys
+	// (distinct clients) can never share a web session.
+	{
+		fileKeys, err := loadKeysFile(cfg.ProxyKeysFile)
+		if err != nil {
+			return nil, err
+		}
+		seen := make(map[string]bool)
+		uniq := make([]string, 0, len(fileKeys)+1)
+		add := func(k string) {
+			if k != "" && !seen[k] {
+				seen[k] = true
+				uniq = append(uniq, k)
+			}
+		}
+		if cfg.ProxyAPIKey != "" {
+			add(cfg.ProxyAPIKey)
+		}
+		for _, k := range fileKeys {
+			add(k)
+		}
+		if len(uniq) == 0 {
+			return nil, fmt.Errorf("no proxy API key configured; set PROXY_API_KEY or %s", cfg.ProxyKeysFile)
+		}
+		cfg.ProxyKeys = uniq
+		if cfg.ProxyAPIKey == "" {
+			cfg.ProxyAPIKey = uniq[0]
+		}
 	}
 	// Legacy: single CONVERSATION_TTL value still supported (backward compat).
 	if v := os.Getenv("CONVERSATION_TTL"); v != "" {
@@ -146,6 +179,34 @@ func loadAccountsFile(path string) ([]string, error) {
 	}
 	var out []string
 	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out, nil
+}
+
+// loadKeysFile reads proxy API keys, one per line. Blank lines and #
+// comments are ignored; an inline " # ..." tail is stripped so
+// "my-key  # for SiYuan" yields the key "my-key". A missing file is not an
+// error (the env var may carry the key).
+func loadKeysFile(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		for _, sep := range []string{" #", "\t#"} {
+			if i := strings.Index(line, sep); i >= 0 {
+				line = line[:i]
+			}
+		}
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue

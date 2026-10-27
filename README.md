@@ -138,7 +138,8 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PORT` | `8080` | Local HTTP port |
-| `PROXY_API_KEY` | none — required | Key clients use to call the proxy |
+| `PROXY_API_KEY` | none | Key clients use to call the proxy; can be empty when `PROXY_KEYS_FILE` supplies keys. At least one key (env or file) is required |
+| `PROXY_KEYS_FILE` | `proxy-keys.txt` | Multi-client keys, one per line. Give each client (SiYuan / opencode / …) a distinct key to fully isolate its DeepSeek sessions |
 | `DEEPSEEK_TOKEN` | empty | DeepSeek web `userToken` |
 | `DEEPSEEK_ACCOUNTS_FILE` | `accounts.txt` | Multi-account file, one token per line |
 | `DEEPSEEK_BASE_URL` | `https://chat.deepseek.com` | Upstream base URL |
@@ -189,6 +190,12 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 - **Round-robin fix.** Unbound prefixes previously resolved to account 0
   (Go's map zero value), pinning every new session to the first account; new
   sessions now genuinely rotate across all live accounts.
+- **Multi-client isolation** (`PROXY_KEYS_FILE`, active with ≥2 keys). Give each
+  client a distinct proxy key (e.g. SiYuan uses key 1, opencode uses key 2). The
+  key's stable id is mixed into the **prefix and fingerprint keys**, so distinct
+  clients can never share a DeepSeek web session — this eliminates the "client B's
+  instruction lands in client A's session" cross-talk. Different tasks under the
+  same key still route to different accounts by fingerprint.
 - **Session persistence** (`PERSIST_SESSIONS`, default off). When on, the
   "prefix / fingerprint / session-id → session record (incl. owning account)"
   index is snapshotted to `<DATA_DIR>/conversations.json` (default: the `data/`

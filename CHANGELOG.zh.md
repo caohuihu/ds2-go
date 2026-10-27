@@ -144,5 +144,15 @@ DeepSeek 网页 token 会静默失效，此前只能在实际请求中途才发�
 - **会话死亡自愈**（跟随 `PERSIST_SESSIONS` 开关，`handlers/handler.go` `shouldSelfHeal`）：缓存/恢复的会话若以**非鉴权错误**（404/5xx/网络——即「上游会话大概率已死」）失败，在同账号重建会话 + 全量历史重放 + 本请求内重试一次（仅非流式请求；401/403 仍走隔离+跨账号迁移，429 仍走退避）。
 - 补全执行路径重构为 `buildAndComplete` 闭包，使自愈可复用同一套 prompt/图片/限流/重试逻辑（`errRequestAborted` 哨兵排除请求本身的错误，不触发自愈）。
 
+### 多客户端密钥（PROXY_KEYS_FILE）+ 跨客户端串台根治
+
+- **多客户端代理密钥**（`PROXY_KEYS_FILE`，默认 `proxy-keys.txt`，`config/config.go` + `handlers/handler.go`）：代理现在可接受任意多个代理 key——`PROXY_API_KEY`（文件有 key 时可为空）+ 文件里每行一个。给每个客户端（思源 1 号 key、opencode 2 号 key…）不同 key，各自的 DeepSeek 网页会话彻底隔离，互不串台。
+- **跨客户端串台根治**（"客户端 B 的指令命中客户端 A 会话"的根因与修复）：
+  - 每个 key 的稳定 ID（sha256 前 8 字节，**与文件行序无关、可持久化**）并入**前缀键**与**指纹键**——不同 key 在内容层就不可能共享会话。
+  - `CONV_FINGERPRINT_ROUTE` 开启时，**所有轮次**都跳过"最近会话兜底"（此前只跳过首轮）：未知指纹请求自建新会话，不再被吸进"别的客户端最近用的会话"。
+  - `RegisterFingerprint` 仅在"本请求新建了会话 / 内容级命中（指纹·前缀·conversation_id）"时执行，**兜底命中绝不登记**——防止错误关联被锁死并落盘（此前正是这一步把 opencode 的指纹登记进了思源的会话）。
+- **运维注意**：升级后旧的持久化前缀/指纹键全部失配（哈希加入了 keyID），所有任务**冷启动一次**（新会话+全量重放历史）；被污染过的 `conversations.json` 建议直接删除重建。
+
+
 
 

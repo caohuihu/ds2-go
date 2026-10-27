@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -117,7 +118,11 @@ type Handler struct {
 	// persister is optional; when set, the conversation index is snapshotted
 	// to the local data file (PERSIST_SESSIONS) so tasks survive a restart.
 	persister *ConvPersister
-	mu        sync.Mutex // protects lastRequestAt
+	// keyIDs maps every accepted proxy API key to its stable id, which is
+	// mixed into the conversation keys so distinct clients (distinct keys)
+	// can never share a web session.
+	keyIDs map[string]string
+	mu     sync.Mutex // protects lastRequestAt
 	// lastRequestAt tracks the time of the last request per client pointer,
 	// enforcing a cooldown to simulate a human reading the reply.
 	lastRequestAt map[*deepseek.Client]time.Time
@@ -149,12 +154,25 @@ func New(cfg *config.Config, pool *AccountPool, convs *ConvStore) *Handler {
 		lastRequestAt:     make(map[*deepseek.Client]time.Time),
 		pending:           make(map[string]*pendingEntry),
 		prefixToClientIdx: make(map[string]int),
+		keyIDs:            make(map[string]string, len(cfg.ProxyKeys)),
+	}
+	for _, k := range cfg.ProxyKeys {
+		h.keyIDs[k] = keyIDOf(k)
 	}
 	// Start background goroutine for periodic DeviceID rotation.
 	if cfg.DeviceIDRotateHours > 0 {
 		go h.startDeviceIDRotation()
 	}
 	return h
+}
+
+// keyIDOf returns a stable, order-independent identifier for a proxy API key
+// (first 8 bytes of sha256). It is what joins the conversation keys, so the
+// same key always yields the same id across restarts and reordering of the
+// keys file, while distinct keys yield distinct ids.
+func keyIDOf(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:8])
 }
 
 // SetHealthChecker attaches the optional token-health checker used to
@@ -268,7 +286,22 @@ func writeError(w http.ResponseWriter, status int, errType, msg string) {
 	json.NewEncoder(w).Encode(e)
 }
 
-// Auth guards /v1/* with the proxy API key.
+// clientKeyIDKey is the context key carrying the authenticated client's key id.
+type clientKeyIDKey struct{}
+
+// clientKeyID returns the stable id of the proxy API key this request
+// authenticated with, or "" when the request did not go through Auth.
+func clientKeyID(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	id, _ := ctx.Value(clientKeyIDKey{}).(string)
+	return id
+}
+
+// Auth guards /v1/* with the accepted proxy API keys (PROXY_API_KEY +
+// PROXY_KEYS_FILE). The matching key's stable id is attached to the request
+// context so downstream conversation keys can isolate distinct clients.
 func (h *Handler) Auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := ""
@@ -278,10 +311,12 @@ func (h *Handler) Auth(next http.HandlerFunc) http.HandlerFunc {
 		if key == "" {
 			key = r.Header.Get("X-Api-Key")
 		}
-		if key == "" || key != h.cfg.ProxyAPIKey {
+		id, ok := h.keyIDs[key]
+		if !ok {
 			writeError(w, http.StatusUnauthorized, "authentication_error", "invalid proxy API key")
 			return
 		}
+		r = r.WithContext(context.WithValue(r.Context(), clientKeyIDKey{}, id))
 		next(w, r)
 	}
 }
@@ -344,7 +379,11 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	toolFlow := hasToolFlow(req.Messages)
 	useToolPath := activeTools || toolFlow
 
-	conv, fresh, err := h.conversation(&req, m, toolFlow)
+	// keyID isolates this client's conversations: it is mixed into the prefix
+	// and fingerprint keys so distinct proxy API keys never share a session.
+	keyID := clientKeyID(r.Context())
+
+	conv, fresh, how, err := h.conversation(&req, m, toolFlow, keyID)
 	if err != nil {
 		log.Printf("chat: create session failed: %v", err)
 		status, msg := mapUpstreamError(err)
@@ -356,7 +395,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	// quarantined (its token expired), migrate it to a live account before
 	// locking: evict the stale session and re-resolve so the prefix re-binds
 	// to a live account with a full history replay.
-	conv, fresh, err = h.migrateOffDeadAccount(&req, m, toolFlow, conv, fresh)
+	conv, fresh, how, err = h.migrateOffDeadAccount(&req, m, toolFlow, conv, fresh, how, keyID)
 	if err != nil {
 		log.Printf("chat: create session failed: %v", err)
 		status, msg := mapUpstreamError(err)
@@ -581,12 +620,12 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	if shouldSelfHeal(err, req.Stream, h.cfg.PersistSessions, fresh, r.Context().Err() != nil) {
 		log.Printf("chat: cached session %s looks dead (%v); recreating on the same account and retrying once", conv.SessionID[:8], err)
 		h.convs.Evict(conv.SessionID)
-		key := PrefixKey(req.Messages[:len(req.Messages)-1], m.ID)
+		key := PrefixKey(req.Messages[:len(req.Messages)-1], m.ID, keyID)
 		nc, cerr := h.coalesceOrCreate(key, m.ID)
 		if cerr != nil {
 			log.Printf("chat: self-heal session create failed: %v", cerr)
 		} else {
-			conv, fresh = nc, true
+			conv, fresh, how = nc, true, howCreated
 			// Reset the per-response state so the failed first attempt
 			// (partial text, stale detector, usage baseline) cannot
 			// contaminate the retry.
@@ -648,18 +687,24 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	} else {
 		nextMsg = chatMessage{Role: "assistant", Content: json.RawMessage(mustJSON(reply.String()))}
 	}
-	key := PrefixKey(append(append([]chatMessage{}, req.Messages...), nextMsg), m.ID)
+	key := PrefixKey(append(append([]chatMessage{}, req.Messages...), nextMsg), m.ID, keyID)
 	h.convs.Register(key, conv)
 	log.Printf("chat: registered conv session=%s turns=%d keyLen=%d toolCalls=%d", conv.SessionID[:8], conv.Turn, len(key), len(emittedCalls))
 
 	// Conversation-opening fingerprint (CONV_FINGERPRINT_ROUTE): the next
 	// request of this task will compute the same fingerprint — system +
-	// first user + first assistant (now known) + model — and re-attach to
-	// this session/account no matter how its rolling prefix hashing turns
+	// first user + first assistant (now known) + model + keyID — and re-attach
+	// to this session/account no matter how its rolling prefix hashing turns
 	// out.
-	if h.cfg.ConvFingerprintRoute {
+	//
+	// Register only when the request genuinely belongs to this session:
+	// a freshly created session, or one matched by content (fingerprint /
+	// prefix / conversation_id). Never on a strategy-3 most-recent fallback,
+	// which is what allowed a foreign client's fingerprint to be locked into
+	// another client's session.
+	if h.cfg.ConvFingerprintRoute && how != howRecent {
 		full := append(append([]chatMessage{}, req.Messages...), nextMsg)
-		h.convs.RegisterFingerprint(convFingerprint(full, m.ID), conv)
+		h.convs.RegisterFingerprint(convFingerprint(full, m.ID, keyID), conv)
 	}
 	h.persistMark()
 
@@ -727,7 +772,19 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 //   2. Prefix-key match (historical messages match an existing session)
 //   3. Fallback to most-recently-used session for the same model (enables
 //      continuous Q&A even when the client sends only the latest message)
-func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool) (*Conversation, bool, error) {
+// howResolved records how conversation() resolved the session, so
+// fingerprint registration can avoid locking in a wrong association.
+type howResolved int
+
+const (
+	howCreated        howResolved = iota // this request created a fresh session
+	howConversationID                    // strategy 1: explicit conversation_id
+	howPrefix                             // strategy 2: full-history prefix match
+	howFingerprint                        // strategy 2.5: conversation-opening match
+	howRecent                             // strategy 3: most-recent fallback (no identity proof)
+)
+
+func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool, keyID string) (*Conversation, bool, howResolved, error) {
 	// Debug: log the incoming request structure
 	msgCount := len(req.Messages)
 	lastMsgText := ""
@@ -737,14 +794,14 @@ func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool) (*
 			lastMsgText = lastMsgText[:60] + "..."
 		}
 	}
-	log.Printf("chat: conversation lookup model=%s msgs=%d convID=%s toolLoop=%v lastMsg=%q",
-		m.ID, msgCount, req.ConversationID, toolLoop, lastMsgText)
+	log.Printf("chat: conversation lookup model=%s msgs=%d convID=%s toolLoop=%v keyID=%s lastMsg=%q",
+		m.ID, msgCount, req.ConversationID, toolLoop, keyID, lastMsgText)
 
 	// Strategy 1: explicit conversation ID
 	if req.ConversationID != "" {
 		if c := h.convs.BySession(req.ConversationID); c != nil {
 			log.Printf("chat: strategy1 hit convID=%s session=%s", req.ConversationID, c.SessionID[:8])
-			return c, false, nil
+			return c, false, howConversationID, nil
 		}
 		log.Printf("chat: strategy1 miss convID=%s (not found)", req.ConversationID)
 	}
@@ -760,52 +817,49 @@ func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool) (*
 		}
 	}
 
-	// Strategy 2: prefix-based cache hit.
+	// Strategy 2: prefix-based cache hit (the prefix key mixes in the client's
+	// keyID, so distinct clients never share a prefix).
 	// On a hit, we may evict the cached session (with SessionResetChance) so
 	// that future requests can start fresh — this is what enables parallel
 	// agent tool-calls to each get their own DeepSeek session.
-	key := PrefixKey(req.Messages[:len(req.Messages)-1], m.ID)
+	key := PrefixKey(req.Messages[:len(req.Messages)-1], m.ID, keyID)
 	if c := h.convs.ByPrefix(key); c != nil {
 		log.Printf("chat: strategy2 hit session=%s turns=%d", c.SessionID[:8], c.Turn)
 		evict(c)
 		if h.convs.ByPrefix(key) == c {
-			return c, false, nil
+			return c, false, howPrefix, nil
 		}
 	}
 
-	// Strategy 2.5 (only when the fingerprint router is on): match the
-	// conversation by its opening (system + first user + first assistant +
-	// model). Robust to rolling-prefix misses: mid-task requests re-attach
-	// to their own session even when the client's echoed history no longer
-	// hashes to a registered prefix.
+	// Strategy 2.5 (only when the fingerprint router is on, and never on the
+	// first turn of a task): match the conversation by its opening (system +
+	// first user + first assistant + model + keyID). Robust to
+	// rolling-prefix misses: mid-task requests re-attach to their own
+	// session even when the client's echoed history no longer hashes to a
+	// registered prefix. The keyID keeps distinct clients from ever matching
+	// each other's openings.
 	firstTurn := lastAssistantIndex(req.Messages) < 0
 	if h.cfg.ConvFingerprintRoute && !firstTurn {
-		fp := convFingerprint(req.Messages, m.ID)
+		fp := convFingerprint(req.Messages, m.ID, keyID)
 		if c := h.convs.ByFingerprint(fp); c != nil {
 			log.Printf("chat: fingerprint hit session=%s turns=%d", c.SessionID[:8], c.Turn)
 			evict(c)
 			if h.convs.ByFingerprint(fp) == c {
-				return c, false, nil
+				return c, false, howFingerprint, nil
 			}
 		}
 	}
 
-	// Strategy 3: fallback — reuse the most recently used session for this model.
-	// Same eviction logic: occasionally drop the cached session so concurrent
-	// requests don't all fight over the same one.
-	//
-	// Skipped for first-turn requests when the fingerprint router is on: a new
-	// task must start a fresh session on the next round-robin account, not be
-	// folded into whoever's session happens to be most recent. Mid-task
-	// requests keep the fallback as a last resort when their fingerprint
-	// misses (client mangled the echoed history).
-	skipRecent := h.cfg.ConvFingerprintRoute && firstTurn
-	if !skipRecent {
+	// Strategy 3: fallback — reuse the most recently used session for this
+	// model. It is only consulted when the fingerprint router is OFF; with it
+	// ON, an unknown (first-turn or unregistered) conversation starts a fresh
+	// session instead of leaking into some other client's most-recent one.
+	if !h.cfg.ConvFingerprintRoute {
 		if c := h.convs.RecentForModel(m.ID); c != nil {
 			log.Printf("chat: strategy3 hit session=%s turns=%d", c.SessionID[:8], c.Turn)
 			evict(c)
 			if h.convs.BySession(c.SessionID) == c {
-				return c, false, nil
+				return c, false, howRecent, nil
 			}
 		}
 	}
@@ -813,10 +867,10 @@ func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool) (*
 	// spawning its own session, share one in-flight session creation.
 	conv, err := h.coalesceOrCreate(key, m.ID)
 	if err != nil {
-		return nil, false, err
+		return nil, false, howCreated, err
 	}
 	log.Printf("chat: new session created session=%s model=%s", conv.SessionID[:8], m.ID)
-	return conv, true, nil
+	return conv, true, howCreated, nil
 }
 
 // migrateOffDeadAccount moves a conversation whose account has since been
@@ -824,21 +878,21 @@ func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool) (*
 // and re-resolves; coalesceOrCreate rebinds the prefix to a live account via
 // NextLive and the new session replays the full history (fresh=true). It
 // stops as soon as the conversation lands on a live account.
-func (h *Handler) migrateOffDeadAccount(req *chatRequest, m *ModelInfo, toolLoop bool, conv *Conversation, fresh bool) (*Conversation, bool, error) {
+func (h *Handler) migrateOffDeadAccount(req *chatRequest, m *ModelInfo, toolLoop bool, conv *Conversation, fresh bool, how howResolved, keyID string) (*Conversation, bool, howResolved, error) {
 	for attempt := 0; attempt < 4; attempt++ {
 		idx := h.pool.IndexOf(conv.Client)
 		if idx >= 0 && !h.pool.IsDead(idx) {
-			return conv, fresh, nil
+			return conv, fresh, how, nil
 		}
 		log.Printf("chat: conversation %s sits on dead account #%d, migrating to a live account", conv.SessionID[:8], idx+1)
 		h.convs.Evict(conv.SessionID)
 		var err error
-		conv, fresh, err = h.conversation(req, m, toolLoop)
+		conv, fresh, how, err = h.conversation(req, m, toolLoop, keyID)
 		if err != nil {
-			return conv, fresh, err
+			return conv, fresh, how, err
 		}
 	}
-	return conv, fresh, nil
+	return conv, fresh, how, nil
 }
 
 // restoreConvRecords rebuilds in-memory state from persisted session records

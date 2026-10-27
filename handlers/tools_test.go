@@ -243,7 +243,7 @@ func TestPrefixKeyIncludesToolCalls(t *testing.T) {
 	plain := []chatMessage{
 		{Role: "user", Content: json.RawMessage(`"hi"`)},
 	}
-	if PrefixKey(withCalls, "deepseek-chat") == PrefixKey(plain, "deepseek-chat") {
+	if PrefixKey(withCalls, "deepseek-chat", "k1") == PrefixKey(plain, "deepseek-chat", "k1") {
 		t.Fatal("prefix key must distinguish tool flow")
 	}
 	// re-serialized (different key order) tool_calls hash the same
@@ -252,7 +252,7 @@ func TestPrefixKeyIncludesToolCalls(t *testing.T) {
 		{Role: "assistant", ToolCalls: json.RawMessage(`[{"function":{"arguments":{},"name":"bash"},"type":"function","id":"call_1"}]`)},
 		{Role: "tool", ToolCallID: "call_1", Content: json.RawMessage(`"out"`)},
 	}
-	if PrefixKey(withCalls, "deepseek-chat") != PrefixKey(reshaped, "deepseek-chat") {
+	if PrefixKey(withCalls, "deepseek-chat", "k1") != PrefixKey(reshaped, "deepseek-chat", "k1") {
 		t.Fatal("prefix key must be stable across tool_calls re-serialization")
 	}
 }

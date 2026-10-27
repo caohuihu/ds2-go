@@ -91,6 +91,7 @@ func main() {
 		log.Printf("deepseek2api listening on :%s", cfg.Port)
 		log.Printf("  upstream           : %s", cfg.BaseURL)
 		log.Printf("  accounts           : %d", len(cfg.Accounts))
+		log.Printf("  proxy keys          : %d (each key isolates its client's sessions)", len(cfg.ProxyKeys))
 		log.Printf("  default model      : %s", cfg.DefaultModel)
 		log.Printf("  conv ttl               : random from %v", cfg.ConversationTTLOptions)
 		log.Printf("  account qpm              : %d", cfg.AccountQPM)

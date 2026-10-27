@@ -30,7 +30,7 @@ func TestConvFingerprintStableAcrossTurns(t *testing.T) {
 	a1 := chatMessage{Role: "assistant", Content: json.RawMessage(`"ok, starting"`)}
 	turn1 := append(taskMessages(false), a1) // what we register after turn 1
 	turn2 := taskMessages(true)              // what the client sends next
-	if convFingerprint(turn1, "deepseek-chat") != convFingerprint(turn2, "deepseek-chat") {
+	if convFingerprint(turn1, "deepseek-chat", "key1") != convFingerprint(turn2, "deepseek-chat", "key1") {
 		t.Fatal("fingerprint must be stable across turns of one task")
 	}
 }
@@ -40,18 +40,33 @@ func TestConvFingerprintDiffers(t *testing.T) {
 	otherUser := taskMessages(true)
 	otherUser[1].Content = json.RawMessage(`"a completely different task"`)
 
-	if convFingerprint(base, "deepseek-chat") == convFingerprint(otherUser, "deepseek-chat") {
+	if convFingerprint(base, "deepseek-chat", "key1") == convFingerprint(otherUser, "deepseek-chat", "key1") {
 		t.Fatal("different first user must give different fingerprints")
 	}
-	if convFingerprint(base, "deepseek-chat") == convFingerprint(base, "deepseek-reasoner") {
+	if convFingerprint(base, "deepseek-chat", "key1") == convFingerprint(base, "deepseek-reasoner", "key1") {
 		t.Fatal("different model must give different fingerprints")
 	}
 
 	// two tasks with the same opening text but different first replies
 	otherAsst := taskMessages(true)
 	otherAsst[2].Content = json.RawMessage(`"different first reply"`)
-	if convFingerprint(base, "deepseek-chat") == convFingerprint(otherAsst, "deepseek-chat") {
+	if convFingerprint(base, "deepseek-chat", "key1") == convFingerprint(otherAsst, "deepseek-chat", "key1") {
 		t.Fatal("first-reply anchor must separate same-opening tasks")
+	}
+}
+
+func TestKeyIsolatesFingerprints(t *testing.T) {
+	base := taskMessages(true)
+	// identical content but different clients (keyID) must NOT collide
+	if convFingerprint(base, "deepseek-chat", "keyA") == convFingerprint(base, "deepseek-chat", "keyB") {
+		t.Fatal("distinct proxy keys must give different fingerprints (client isolation)")
+	}
+	if PrefixKey(base[:1], "deepseek-chat", "keyA") == PrefixKey(base[:1], "deepseek-chat", "keyB") {
+		t.Fatal("distinct proxy keys must give different prefix keys (client isolation)")
+	}
+	// the same key is stable regardless of how many keys the handler knows
+	if keyIDOf("some-key") != keyIDOf("some-key") {
+		t.Fatal("keyIDOf must be deterministic")
 	}
 }
 
@@ -70,7 +85,7 @@ func TestConvFingerprintToolCallsCanonical(t *testing.T) {
 		{Role: "user", Content: json.RawMessage(`"hi"`)},
 		{Role: "assistant", ToolCalls: reshaped},
 	}
-	if convFingerprint(a, "deepseek-chat") != convFingerprint(b, "deepseek-chat") {
+	if convFingerprint(a, "deepseek-chat", "key1") != convFingerprint(b, "deepseek-chat", "key1") {
 		t.Fatal("fingerprint must be stable across tool_calls re-serialization")
 	}
 }

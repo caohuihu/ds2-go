@@ -1,5 +1,7 @@
 # secrets and local files
 accounts.txt
+proxy-keys.txt
+data/
 *.log
 
 # build output

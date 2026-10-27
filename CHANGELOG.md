@@ -113,6 +113,28 @@ All notable changes to this project will be documented in this file.
   - New pool helper `FindByMask` re-maps persisted account ids (masked token
     prefixes) to current pool indices after an `accounts.txt` reorder.
 
+- **Multi-client proxy keys + cross-client isolation**
+  (`config/config.go`, `handlers/handler.go`)
+  - The proxy now accepts any number of proxy API keys: `PROXY_API_KEY`
+    (optional when the file supplies keys) plus one-per-line entries in
+    `PROXY_KEYS_FILE` (default `proxy-keys.txt`). `PROXY_API_KEY` is no longer
+    strictly required — at least one key overall is.
+  - Each key gets a stable, order-independent id (first 8 bytes of sha256)
+    that is mixed into **both** the prefix cache key and the
+    conversation-opening fingerprint. Distinct clients (distinct keys) can
+    therefore never share a DeepSeek web session.
+  - **Cross-client crosstalk fix**: with `CONV_FINGERPRINT_ROUTE` on, the
+    most-recent-session fallback is now skipped for *all* turns (not just
+    first turns), so an unknown-fingerprint request starts its own session
+    instead of leaking into another client's most-recent one. And
+    `RegisterFingerprint` only runs when the session is content-verified
+    (created / fingerprint / prefix / conversation_id) — never on a bare
+    recent fallback, which previously could lock a foreign client's
+    fingerprint into another client's session and persist it.
+  - Note: upgrading changes the persisted prefix/fingerprint keys (keyID was
+    added to the hash), so every task cold-starts once; delete a contaminated
+    `conversations.json` to reset.
+
 
 ### Changed
 

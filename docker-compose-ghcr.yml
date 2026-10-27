@@ -5,7 +5,8 @@ services:
     ports:
       - "8022:8080"
     environment:
-      - PROXY_API_KEY=${PROXY_API_KEY}
+      - PROXY_API_KEY=${PROXY_API_KEY:-}
+      - PROXY_KEYS_FILE=${PROXY_KEYS_FILE:-proxy-keys.txt}
       - DEEPSEEK_TOKEN=${DEEPSEEK_TOKEN:-}
       - DEEPSEEK_ACCOUNTS_FILE=${DEEPSEEK_ACCOUNTS_FILE:-accounts.txt}
       - PORT=${PORT:-8080}
@@ -53,6 +54,8 @@ services:
       - DATA_DIR=${DATA_DIR:-}
     volumes:
       - ./accounts.txt:/app/accounts.txt:ro
+      # 多客户端代理密钥（可选，每行一个 key；不挂载则用 PROXY_API_KEY 单 key）
+      - ./proxy-keys.txt:/app/proxy-keys.txt:ro
       # 日志文件（可选，设置 LOG_FILE 后生效）
       - ./logs:/app/logs
       # 会话持久化数据（PERSIST_SESSIONS=true 时生效；不挂载则容器重建后丢失）

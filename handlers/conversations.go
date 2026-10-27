@@ -347,11 +347,12 @@ func (s *ConvStore) sweepOnce(ctx context.Context) {
 // PrefixKey derives the cache key for "messages except the last one", so a
 // client that appends one exchange per request keeps hitting the same
 // DeepSeek session. The model is part of the key: switching models starts a
-// new session, matching DeepSeek's per-session model. Image references are
-// fingerprinted too, so image turns cache correctly. Assistant tool_calls
-// and tool message ids are canonicalized into the key so agent tool loops
-// map back onto the same session.
-func PrefixKey(messages []chatMessage, model string) string {
+// new session, matching DeepSeek's per-session model. The keyID (the client's
+// proxy API key) is part of the key too, so distinct clients never share a
+// prefix. Image references are fingerprinted as well, so image turns cache
+// correctly. Assistant tool_calls and tool message ids are canonicalized
+// into the key so agent tool loops map back onto the same session.
+func PrefixKey(messages []chatMessage, model, keyID string) string {
 	h := sha256.New()
 	for _, m := range messages {
 		h.Write([]byte(m.Role))
@@ -365,22 +366,27 @@ func PrefixKey(messages []chatMessage, model string) string {
 	}
 	h.Write([]byte{0x00})
 	h.Write([]byte(model))
+	h.Write([]byte{0x00})
+	h.Write([]byte(keyID))
 	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 // convFingerprint identifies a client-side conversation by its opening:
-// system + first user message + first assistant reply + model. Used when
-// CONV_FINGERPRINT_ROUTE is enabled:
+// system + first user message + first assistant reply + model + the client's
+// keyID. Used when CONV_FINGERPRINT_ROUTE is enabled:
 //
 //   - the first assistant reply anchors the key (like webai2api), so two
 //     conversations with the same opening text but different replies never
 //     collide;
+//   - the keyID (the client's proxy API key) is a component, so distinct
+//     clients can never match each other's openings even if their content is
+//     identical;
 //   - a first-turn request (no assistant yet) computes a fingerprint that
 //     can never match a stored one (stored keys always carry the anchor),
 //     which is exactly what makes a new task start a fresh session;
 //   - the first assistant is taken in canonical tool_calls form so client
 //     re-serialization cannot break the match.
-func convFingerprint(messages []chatMessage, model string) string {
+func convFingerprint(messages []chatMessage, model, keyID string) string {
 	var system, firstUser, firstAsst string
 	for _, m := range messages {
 		switch m.Role {
@@ -403,10 +409,10 @@ func convFingerprint(messages []chatMessage, model string) string {
 		}
 	}
 	// Bounded prefixes keep the key stable under cosmetic client prompt drift.
-	return fingerprintHash(system, firstUser, firstAsst, model)
+	return fingerprintHash(system, firstUser, firstAsst, model, keyID)
 }
 
-func fingerprintHash(system, firstUser, firstAsst, model string) string {
+func fingerprintHash(system, firstUser, firstAsst, model, keyID string) string {
 	bound := func(s string, n int) string {
 		if len(s) > n {
 			return s[:n]
@@ -421,5 +427,7 @@ func fingerprintHash(system, firstUser, firstAsst, model string) string {
 	h.Write([]byte(bound(firstAsst, 200)))
 	h.Write([]byte{0x00})
 	h.Write([]byte(model))
+	h.Write([]byte{0x00})
+	h.Write([]byte(keyID))
 	return hex.EncodeToString(h.Sum(nil)[:16])
 }
