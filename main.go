@@ -113,6 +113,11 @@ func main() {
 		}
 		log.Printf("  health probe             : live every %s, dead retry every %s (startup check %v)",
 			cfg.HealthProbeInterval, cfg.HealthProbeDeadRetry, cfg.StartupAccountCheck)
+		if cfg.BanQuarantineHours > 0 {
+			log.Printf("  ban quarantine           : %dh hold on BAN-detected accounts (429 backoff: 60s x2 per hit, cap 900s)", cfg.BanQuarantineHours)
+		} else {
+			log.Printf("  ban quarantine           : banned accounts held until a probe succeeds (429 backoff: 60s x2 per hit, cap 900s)")
+		}
 		if cfg.RequestsPerSession > 0 {
 			log.Printf("  requests per session     : %d (auto-rotate after N turns)", cfg.RequestsPerSession)
 		}

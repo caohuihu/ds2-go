@@ -90,12 +90,22 @@ type AccountPool struct {
 	// mu protects dead: quarantined account index → reason. Quarantine
 	// happens only on upstream auth failures (401/403), never on 429, 5xx
 	// or network errors. See health.go for the state-machine methods.
-	mu   sync.Mutex
-	dead map[int]string
+	// It also protects rateHits (429 escalations) and cooldownUntil
+	// (account-level rate backoff) and banUntil (BAN hold).
+	mu            sync.Mutex
+	dead          map[int]string
+	rateHits      []int
+	cooldownUntil []time.Time
+	banUntil      []time.Time
 }
 
 func NewPool(tokens []string, powJitterMin, powJitterMax, rotateInterval time.Duration) *AccountPool {
-	p := &AccountPool{dead: make(map[int]string)}
+	p := &AccountPool{
+		dead:          make(map[int]string),
+		rateHits:      make([]int, len(tokens)),
+		cooldownUntil: make([]time.Time, len(tokens)),
+		banUntil:      make([]time.Time, len(tokens)),
+	}
 	for _, t := range tokens {
 		p.clients = append(p.clients, deepseek.NewClient(t, powJitterMin, powJitterMax, rotateInterval))
 	}
@@ -592,20 +602,39 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 
 	err = buildAndComplete(conv, fresh)
 
-	// Passive detection: an upstream auth failure observed mid-request
-	// quarantines the account immediately so the next request migrates off
-	// it (see migrateOffDeadAccount). Only 401/403 qualify — 429 stays a
-	// rate-limit, not a token problem.
+	// Passive detection: an upstream failure observed mid-request quarantines
+	// the account immediately so the next request migrates off it (see
+	// migrateOffDeadAccount).
+	//
+	// BAN detection first: an upstream ban ("账号已被封禁", "banned", …) is not
+	// an expiring token — retrying a banned account only makes the ban worse,
+	// so it is held out of rotation for BanQuarantineHours (0 = until a
+	// probe succeeds). Only 401/403 without ban wording are token problems.
 	if err != nil {
-		var ae *deepseek.APIError
-		if errors.As(err, &ae) && (ae.HTTPStatus == 401 || ae.HTTPStatus == 403) {
-			idx := h.pool.IndexOf(conv.Client)
-			if idx >= 0 {
-				reason := fmt.Sprintf("upstream http %d during completion", ae.HTTPStatus)
+		if idx := h.pool.IndexOf(conv.Client); idx >= 0 {
+			if kw := banKeyword(err); kw != "" {
+				reason := "upstream ban detected (" + kw + ")"
+				if h.pool.Quarantine(idx, reason) {
+					if h.cfg.BanQuarantineHours > 0 {
+						hold := time.Duration(h.cfg.BanQuarantineHours) * time.Hour
+						h.pool.SetBanUntil(idx, time.Now().Add(hold))
+						log.Printf("health: account #%d/%d %s → held for %s (BAN_QUARANTINE_HOURS=%d)", idx+1, len(h.pool.clients), reason, hold, h.cfg.BanQuarantineHours)
+					} else {
+						log.Printf("health: account #%d/%d %s → quarantined until a probe succeeds", idx+1, len(h.pool.clients), reason)
+					}
+				}
 				if h.health != nil {
 					h.health.EventQuarantine(idx, reason)
-				} else {
-					h.pool.Quarantine(idx, reason)
+				}
+			} else {
+				var ae *deepseek.APIError
+				if errors.As(err, &ae) && (ae.HTTPStatus == 401 || ae.HTTPStatus == 403) {
+					reason := fmt.Sprintf("upstream http %d during completion", ae.HTTPStatus)
+					if h.health != nil {
+						h.health.EventQuarantine(idx, reason)
+					} else {
+						h.pool.Quarantine(idx, reason)
+					}
 				}
 			}
 		}
@@ -779,9 +808,9 @@ type howResolved int
 const (
 	howCreated        howResolved = iota // this request created a fresh session
 	howConversationID                    // strategy 1: explicit conversation_id
-	howPrefix                             // strategy 2: full-history prefix match
-	howFingerprint                        // strategy 2.5: conversation-opening match
-	howRecent                             // strategy 3: most-recent fallback (no identity proof)
+	howPrefix                            // strategy 2: full-history prefix match
+	howFingerprint                       // strategy 2.5: conversation-opening match
+	howRecent                            // strategy 3: most-recent fallback (no identity proof)
 )
 
 func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool, keyID string) (*Conversation, bool, howResolved, error) {
@@ -1121,6 +1150,27 @@ func shouldSelfHeal(err error, stream, enabled, isFresh, clientGone bool) bool {
 	return true
 }
 
+// banKeywords are upstream error wordings that signal an account ban rather
+// than a token expiry or a transient fault. Matched only on the error path
+// (API error messages), never on model reply content.
+var banKeywords = []string{
+	"封禁", "被封", "封号", "封停", "账号已被限制", "账号异常", "banned", "suspended",
+}
+
+// banKeyword returns the first ban keyword found in the error's text, or "".
+func banKeyword(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.ToLower(err.Error())
+	for _, kw := range banKeywords {
+		if strings.Contains(text, strings.ToLower(kw)) {
+			return kw
+		}
+	}
+	return ""
+}
+
 func mapUpstreamError(err error) (int, string) {
 	if errors.Is(err, errNoLiveAccount) {
 		return http.StatusServiceUnavailable, errNoLiveAccount.Error()
@@ -1144,6 +1194,10 @@ func mapUpstreamError(err error) (int, string) {
 // to preserve context; only the read-time cooldown and QPM token bucket provide
 // back-pressure.
 func (h *Handler) chatWithRetry(ctx context.Context, conv *Conversation, input deepseek.CompletionInput, cb *deepseek.StreamCallbacks) error {
+	// Account-level backoff: each 429 seen on this account escalates the
+	// pool-wide cooldown for it (so later requests route around it); a
+	// success clears the escalation.
+	idx := h.pool.IndexOf(conv.Client)
 	var lastErr error
 	baseDelay := h.cfg.RetryBaseDelay
 	if baseDelay <= 0 {
@@ -1152,12 +1206,14 @@ func (h *Handler) chatWithRetry(ctx context.Context, conv *Conversation, input d
 	for attempt := 0; attempt <= h.cfg.RetryMaxAttempts; attempt++ {
 		lastErr = h.doCompletionWithRetry(ctx, conv.Client, input, cb, baseDelay, attempt)
 		if lastErr == nil {
+			h.pool.MarkRateRecovery(idx)
 			return nil
 		}
 		var ae *deepseek.APIError
 		if !errors.As(lastErr, &ae) || ae.HTTPStatus != 429 {
 			break // non-429 error: don't retry
 		}
+		h.pool.MarkRateLimited(idx)
 		// Rate-limited — retry on the same account with increasing delay.
 		// Switching accounts would break the conversation context, so we
 		// stay put and wait.

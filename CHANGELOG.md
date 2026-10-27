@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Account-level 429 backoff + all-pool grace window** (`handlers/health.go`, `handlers/handler.go`)
+  - Every 429 seen on an account escalates its cross-request cooldown:
+    `60s × 2^(consecutive hits − 1)`, capped at 900s. New sessions route
+    around cooling accounts (`NextLive` skips them); one successful
+    completion clears the escalation. This complements the in-request
+    backoff — without it, the next request after a failed one rammed the
+    same throttled account again.
+  - Grace window: when *every* account is cooling, the one recovering
+    soonest (≤45s left) is still offered, so the pool never 503s
+    prematurely.
+- **BAN circuit breaker** (`handlers/health.go`, `handlers/handler.go`)
+  - Upstream errors carrying ban wording (“封禁”, “被封”, “封号”, “封停”,
+    “账号已被限制”, “账号异常”, “banned”, “suspended” — matched on the error
+    path only, never on reply content) quarantine the account and *hold*
+    it out of rotation and out of probes.
+  - New env `BAN_QUARANTINE_HOURS` (default `168` = 7 days): the hold
+    duration; `0` = hold until a probe succeeds (legacy behaviour). After
+    the hold expires, probes resume and a success revives the account.
+- New startup banner line reporting the ban-hold window.
+
 - **Per-account rate limiting** (`handlers/limiter.go`)
   - Token-bucket QPM (requests per minute) limiter per DeepSeek account, keyed by `deviceID`.
   - In-flight concurrency semaphore per account to prevent burst flooding.

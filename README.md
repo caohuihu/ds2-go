@@ -166,6 +166,7 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | `HEALTH_PROBE_INTERVAL` | `30m` | 周期探测所有存活账号的间隔（0=关闭） |
 | `HEALTH_PROBE_DEAD_RETRY` | `10m` | 对被隔离账号的重试间隔（token 换新后自动复活） |
 | `HEALTH_LOG_FILE` | 同 `LOG_FILE` 目录 | 检测日志文件：隔离/复活/摘要事件，token 只显示掩码；留空默认与主日志同目录（如 `/app/logs/deepseek-health.log`） |
+| `BAN_QUARANTINE_HOURS` | `168` | Hold window for a BAN-detected account (0 = hold until a probe succeeds). 429 account-level backoff is built in, needs no config |
 | `TOOL_JSON_FALLBACK` | `false` | Sniff unmarked bare JSON as tool calls (double criterion: name in whitelist AND has arguments); opt-in |
 | `REASONING_FALLBACK` | `true` | Promote thinking text to content when the reply body is empty |
 | `CONV_FINGERPRINT_ROUTE` | `false` | Route by conversation-opening fingerprint: first turn of a new task gets a fresh session on the next round-robin account; in-progress tasks re-attach to their own session/account |
@@ -261,6 +262,19 @@ finding out mid-request:
   quarantines that account immediately. Conversations bound to it are
   migrated to a live account with a full history replay; if *all* accounts
   are dead, requests fail fast with a clear 503.
+- **Account-level 429 backoff** — every 429 seen on an account escalates a
+  cross-request cooldown: `60s × 2^(consecutive hits − 1)` (60s → 120s →
+  240s … capped at 900s). New sessions route around the cooling account
+  until one completion succeeds and clears it. When *every* account is
+  cooling, the one recovering soonest is still offered, but only with ≤45s
+  left, so a full backoff window is respected instead of 503ing.
+- **BAN circuit breaker** (`BAN_QUARANTINE_HOURS`, default 7 days) — if an
+  upstream error carries ban wording (“封禁”, “账号异常”, “banned”,
+  “suspended” — matched on error paths only, never on reply content), the
+  account is quarantined and *held*: no probes, no traffic, until the hold
+  expires (hammering a banned account only makes the ban worse). After the
+  hold, probes resume and a successful one revives it. `0` = hold forever
+  until a probe succeeds.
 - **Detection log** — every quarantine/revival and a running summary are
   appended to `HEALTH_LOG_FILE`. Left empty, it defaults to the main log's
   folder (`LOG_FILE=/app/logs/app.log` → `/app/logs/deepseek-health.log`), so

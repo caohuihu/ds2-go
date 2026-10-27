@@ -50,7 +50,8 @@ func (p *AccountPool) Quarantine(idx int, reason string) bool {
 	return true
 }
 
-// Revive clears the quarantine. Returns true when the account was dead.
+// Revive clears the quarantine (and any BAN hold). Returns true when the
+// account was dead.
 func (p *AccountPool) Revive(idx int) bool {
 	if idx < 0 || idx >= len(p.clients) {
 		return false
@@ -59,6 +60,7 @@ func (p *AccountPool) Revive(idx int) bool {
 	defer p.mu.Unlock()
 	_, ok := p.dead[idx]
 	delete(p.dead, idx)
+	p.banUntil[idx] = time.Time{}
 	return ok
 }
 
@@ -100,7 +102,11 @@ func (p *AccountPool) HasLive() bool {
 	return p.LiveCount() > 0
 }
 
-// NextLive round-robins over the live accounts, skipping quarantined ones.
+// NextLive round-robins over the live accounts, skipping quarantined and
+// rate-cooling ones. When every live account is in a 429 cooldown, it
+// still lets through the one closest to recovery — but only when less than
+// cooldownGraceWindow remains (letting a nearly-cooled account through
+// beats a 503, while a full backoff window is respected).
 func (p *AccountPool) NextLive() (int, bool) {
 	n := len(p.clients)
 	if n == 0 {
@@ -109,11 +115,112 @@ func (p *AccountPool) NextLive() (int, bool) {
 	start := int(p.next.Add(1)) % n
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
-		if !p.IsDead(idx) {
+		if !p.IsDead(idx) && p.CoolingLeft(idx) <= 0 {
 			return idx, true
 		}
 	}
+	// Grace pass: everyone is dead or cooling; take the live account whose
+	// cooldown ends soonest, within the grace window.
+	deadline := make([]time.Duration, n)
+	for i := range deadline {
+		deadline[i] = p.CoolingLeft(i)
+	}
+	grace := -1
+	for i := 0; i < n; i++ {
+		if p.IsDead(i) || deadline[i] <= 0 || deadline[i] > cooldownGraceWindow {
+			continue
+		}
+		if grace == -1 || deadline[i] < deadline[grace] {
+			grace = i
+		}
+	}
+	if grace >= 0 {
+		return grace, true
+	}
 	return 0, false
+}
+
+// cooldownGraceWindow: all accounts cooling → allow the one that recovers
+// within this window.
+const cooldownGraceWindow = 45 * time.Second
+
+// ---- account-level 429 backoff ----
+//
+// Every 429 seen on an account escalates its cooldown (60s, 120s, 240s, …
+// capped at 900s) so the next *request* skips the throttled account instead
+// of ramming it again; a successful completion clears the escalation. This
+// is the cross-request complement to chatWithRetry's in-request backoff.
+
+// MarkRateLimited records a 429 on the account and puts it into rate
+// cooldown. The nth consecutive 429 without a success cools for
+// min(900s, 60s × 2^(n-1)).
+func (p *AccountPool) MarkRateLimited(idx int) {
+	if idx < 0 || idx >= len(p.clients) {
+		return
+	}
+	p.mu.Lock()
+	p.rateHits[idx]++
+	n := p.rateHits[idx]
+	cool := time.Duration(60*(1<<uint(n-1))) * time.Second
+	if cool > 900*time.Second {
+		cool = 900 * time.Second
+	}
+	p.cooldownUntil[idx] = time.Now().Add(cool)
+	p.mu.Unlock()
+	log.Printf("account #%d/%d rate-limited (429 x%d), cooling down for %s", idx+1, len(p.clients), n, cool.Round(time.Second))
+}
+
+// MarkRateRecovery clears the escalation after a successful completion.
+func (p *AccountPool) MarkRateRecovery(idx int) {
+	if idx < 0 || idx >= len(p.clients) {
+		return
+	}
+	p.mu.Lock()
+	if p.rateHits[idx] > 0 {
+		p.rateHits[idx] = 0
+		p.cooldownUntil[idx] = time.Time{}
+		p.mu.Unlock()
+		log.Printf("account #%d/%d recovered from rate limit", idx+1, len(p.clients))
+		return
+	}
+	p.mu.Unlock()
+}
+
+// CoolingLeft returns the remaining 429 cooldown of the account (0 = none).
+func (p *AccountPool) CoolingLeft(idx int) time.Duration {
+	if idx < 0 || idx >= len(p.clients) {
+		return 0
+	}
+	p.mu.Lock()
+	left := p.cooldownUntil[idx].Sub(time.Now())
+	p.mu.Unlock()
+	if left < 0 {
+		return 0
+	}
+	return left
+}
+
+// SetBanUntil holds a BAN-detected account out of rotation until then (a
+// probe after the hold may still revive it). Until.IsZero() = no hold.
+func (p *AccountPool) SetBanUntil(idx int, until time.Time) {
+	if idx < 0 || idx >= len(p.clients) {
+		return
+	}
+	p.mu.Lock()
+	p.banUntil[idx] = until
+	p.mu.Unlock()
+}
+
+// BanHeld reports whether the account is inside a BAN hold window (its
+// probes are skipped; it re-arms automatically when the window passes).
+func (p *AccountPool) BanHeld(idx int) bool {
+	if idx < 0 || idx >= len(p.clients) {
+		return false
+	}
+	p.mu.Lock()
+	held := !p.banUntil[idx].IsZero() && p.banUntil[idx].After(time.Now())
+	p.mu.Unlock()
+	return held
 }
 
 // DeadReasons snapshots the quarantined accounts and their reasons.
@@ -245,18 +352,39 @@ func (hc *HealthChecker) ProbeAll() {
 }
 
 // RetryDead re-probes quarantined accounts only (useful after a token has
-// been refreshed in accounts.txt).
+// been refreshed in accounts.txt). Accounts still inside a BAN hold window
+// are skipped — hammering a banned account only makes the ban worse; the
+// hold expires and the account re-arms itself automatically.
 func (hc *HealthChecker) RetryDead() {
 	p := hc.pool
 	if p.LiveCount() == len(p.clients) {
 		return // all live; nothing to retry
 	}
 	for idx := range p.clients {
-		if p.IsDead(idx) {
-			hc.ProbeAccount(idx)
+		if !p.IsDead(idx) {
+			continue
 		}
+		if p.BanHeld(idx) {
+			hc.event("probe", probeLabel(p, idx)+" still in BAN hold ("+p.BanHeldLeft(idx).Round(time.Hour).String()+" left), probe skipped")
+			continue
+		}
+		hc.ProbeAccount(idx)
 	}
 	hc.writeSummary()
+}
+
+// BanHeldLeft returns the remaining BAN hold of the account (0 = none).
+func (p *AccountPool) BanHeldLeft(idx int) time.Duration {
+	if idx < 0 || idx >= len(p.clients) {
+		return 0
+	}
+	p.mu.Lock()
+	left := p.banUntil[idx].Sub(time.Now())
+	p.mu.Unlock()
+	if left < 0 {
+		return 0
+	}
+	return left
 }
 
 func (hc *HealthChecker) writeSummary() {
