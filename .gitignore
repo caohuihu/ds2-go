@@ -17,3 +17,7 @@ data/
 # env files
 .env
 .env.*
+
+# track the committed templates (example + presets); real .env stays ignored
+!.env.example
+!.env.risk-hardened.example
