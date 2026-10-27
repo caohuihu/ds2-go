@@ -4,6 +4,12 @@
 
 ## [未发布]
 
+### 日配额 + 拟人长停顿 + 负载均衡选号（参考 webai2api）
+
+- **日配额**（`DAILY_REQUEST_LIMIT`，默认 `0` = 不限，`handlers/usage.go` + `config/config.go`）：每账号按本地自然日计数请求数，计数落盘到 `<DATA_DIR>/daily-usage.json`（重启不清零、跨天归零、损坏文件隔离不崩溃）。达到配额的账号在新建会话选号时被跳过；全部账号都达标时，新会话请求 503（`errDailyLimit`，午夜后自动恢复），已缓存的会话不受影响。
+- **拟人长停顿**（`LONG_PAUSE_CHANCE`，默认 `0` = 关，`handlers/handler.go`）：每个非 agent 请求以该概率额外随机等待 20–60s（"去倒杯水"长尾），叠加在 5–30s 阅读间隔之上，让单账号请求节奏更难被识别为机器节奏。agent 工具循环豁免（保持响应性）。
+- **负载均衡选号**（`handlers/handler.go` + `handlers/limiter.go`）：新增 `AccountLimiter.InFlight`（各账号在途完成数）。前缀需重绑账号（未绑定 / 账号失效 / 账号达日配额）时，选**在途请求最少**的存活账号，轮询序仅在打平时生效——新流量不再堆到最忙账号的队列里。
+
 ### 账号级 429 退避 + 全池冷却宽限（参考 webai2api）
 
 - **429 账号级退避**（`handlers/health.go` + `handlers/handler.go`）：每撞一次 429，该账号进入**跨请求**冷却 `60s × 2^(连撞次数-1)`（60s→120s→240s…封顶 900s）；新会话通过 `NextLive` 自动漂移到健康账号，一次成功完成即清零。此前 429 退避只在单个请求内（`chatWithRetry`），请求失败后**下一个请求立刻又撞同一账号**，现已根治。

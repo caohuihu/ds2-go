@@ -6,6 +6,25 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Daily request quota** (`handlers/usage.go`, `config/config.go`)
+  - New env `DAILY_REQUEST_LIMIT` (default `0` = unlimited): per-account
+    requests are counted per local day and persisted to
+    `<DATA_DIR>/daily-usage.json` (restart-safe; counters reset at midnight,
+    corrupt files are quarantined instead of crashing).
+  - An account at its budget is skipped when picking accounts for new
+    sessions; when *all* live accounts are spent, new sessions fail fast
+    with 503 (`errDailyLimit`) until midnight while cached sessions keep
+    working.
+- **Human-like long pause** (`handlers/handler.go`)
+  - New env `LONG_PAUSE_CHANCE` (default `0` = off): with that probability
+    any non-agent request waits an extra random 20–60 s before hitting
+    upstream ("stepped away" tail on top of the read-time cooldown).
+- **Load-aware account selection** (`handlers/handler.go`, `handlers/limiter.go`)
+  - New `AccountLimiter.InFlight` reports in-flight completions per account.
+  - When a prefix must re-bind its account (unbound / dead / quota-spent),
+    the pool now picks the *least busy* live account instead of bare
+    round-robin; round-robin only breaks ties.
+
 - **Account-level 429 backoff + all-pool grace window** (`handlers/health.go`, `handlers/handler.go`)
   - Every 429 seen on an account escalates its cross-request cooldown:
     `60s × 2^(consecutive hits − 1)`, capped at 900s. New sessions route

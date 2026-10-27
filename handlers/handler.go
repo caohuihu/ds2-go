@@ -55,11 +55,11 @@ func lookupModel(name string) (*ModelInfo, bool) {
 // renamed ids (deepseek-v4.1-flash & co) keep working.
 //
 // Heuristic rules (ordered priority):
-//   1. Exact alias match → use the named model as-is
-//   2. Contains "reasoner" AND "search" → deepseek-reasoner-search
-//   3. Contains "reasoner" or "think" or "-r1" → deepseek-reasoner
-//   4. Contains "search" → deepseek-search
-//   5. Otherwise → deepseek-chat (default)
+//  1. Exact alias match → use the named model as-is
+//  2. Contains "reasoner" AND "search" → deepseek-reasoner-search
+//  3. Contains "reasoner" or "think" or "-r1" → deepseek-reasoner
+//  4. Contains "search" → deepseek-search
+//  5. Otherwise → deepseek-chat (default)
 func resolveModel(name string) (*ModelInfo, bool) {
 	if m, ok := lookupModel(name); ok {
 		return m, true
@@ -132,7 +132,11 @@ type Handler struct {
 	// mixed into the conversation keys so distinct clients (distinct keys)
 	// can never share a web session.
 	keyIDs map[string]string
-	mu     sync.Mutex // protects lastRequestAt
+	// usage is optional; when set (DAILY_REQUEST_LIMIT > 0) per-account
+	// request counters are kept (and persisted) so a fresh account rotation
+	// respects each account's daily quota.
+	usage *UsageTracker
+	mu    sync.Mutex // protects lastRequestAt
 	// lastRequestAt tracks the time of the last request per client pointer,
 	// enforcing a cooldown to simulate a human reading the reply.
 	lastRequestAt map[*deepseek.Client]time.Time
@@ -195,6 +199,13 @@ func (h *Handler) SetHealthChecker(hc *HealthChecker) {
 // the session index to disk (PERSIST_SESSIONS).
 func (h *Handler) SetPersister(p *ConvPersister) {
 	h.persister = p
+}
+
+// SetUsageTracker attaches the optional per-account daily quota tracker
+// (DAILY_REQUEST_LIMIT). When present, fresh account rotation skips accounts
+// that already hit their daily budget today.
+func (h *Handler) SetUsageTracker(u *UsageTracker) {
+	h.usage = u
 }
 
 // persistMark requests a throttled persistence write. Safe to call from any
@@ -797,10 +808,11 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 // occasionally open a new chat instead of continuing an old one.
 //
 // Lookup strategy:
-//   1. Explicit conversation_id passthrough (client controls session)
-//   2. Prefix-key match (historical messages match an existing session)
-//   3. Fallback to most-recently-used session for the same model (enables
-//      continuous Q&A even when the client sends only the latest message)
+//  1. Explicit conversation_id passthrough (client controls session)
+//  2. Prefix-key match (historical messages match an existing session)
+//  3. Fallback to most-recently-used session for the same model (enables
+//     continuous Q&A even when the client sends only the latest message)
+//
 // howResolved records how conversation() resolved the session, so
 // fingerprint registration can avoid locking in a wrong association.
 type howResolved int
@@ -1006,15 +1018,44 @@ func (h *Handler) restoreConvRecords(entries map[string]ConvRecord) (restored, d
 // pinned every new conversation to the first account.
 func (h *Handler) resolveBoundAccount(key string) int {
 	clientIdx, bound := h.prefixToClientIdx[key]
-	if !bound || clientIdx >= len(h.pool.clients) || h.pool.IsDead(clientIdx) {
-		live, ok := h.pool.NextLive()
+	if !bound || clientIdx >= len(h.pool.clients) || h.pool.IsDead(clientIdx) || h.dailyExhausted(clientIdx) {
+		// Pick a replacement: least-busy live account (spreads new traffic
+		// instead of piling onto whoever the bare round-robin points at),
+		// skipping accounts whose daily quota is already used up. The bare
+		// round-robin order still breaks load ties, keeping fairness.
+		start, ok := h.pool.NextLive()
 		if !ok {
 			return -1
 		}
-		h.prefixToClientIdx[key] = live
-		return live
+		n := len(h.pool.clients)
+		best, bestLoad := -1, 0
+		for i := 0; i < n; i++ {
+			idx := (start + i) % n
+			if h.pool.IsDead(idx) || h.dailyExhausted(idx) {
+				continue
+			}
+			load := h.limiter.InFlight(h.pool.clients[idx].DeviceID)
+			if best < 0 || load < bestLoad {
+				best, bestLoad = idx, load
+			}
+		}
+		if best < 0 {
+			return -1 // no live account, or every live one is daily-exhausted
+		}
+		h.prefixToClientIdx[key] = best
+		return best
 	}
 	return clientIdx
+}
+
+// dailyExhausted reports whether the account has already used up today's
+// daily request quota (0/unset limit or no tracker = never exhausted).
+func (h *Handler) dailyExhausted(idx int) bool {
+	if h.usage == nil || h.cfg.DailyRequestLimit <= 0 || idx < 0 || idx >= len(h.pool.clients) {
+		return false
+	}
+	mask := maskToken(h.pool.clients[idx].Token)
+	return h.usage.Count(mask) >= h.cfg.DailyRequestLimit
 }
 
 // coalesceOrCreate ensures all concurrent requests sharing the same prefix
@@ -1046,9 +1087,13 @@ func (h *Handler) coalesceOrCreate(key, modelID string) (*Conversation, error) {
 	// bound to the next live account in round-robin order.
 	clientIdx := h.resolveBoundAccount(key)
 	if clientIdx < 0 {
-		// No live accounts: clean up and fail fast with a clear error.
+		// Either nobody is live, or everyone is live but out of daily
+		// quota — give the matching error (mapUpstreamError maps both to 503).
 		delete(h.pending, key)
 		h.pendingMu.Unlock()
+		if h.pool.HasLive() && h.usage != nil && h.cfg.DailyRequestLimit > 0 {
+			return nil, errDailyLimit
+		}
 		return nil, errNoLiveAccount
 	}
 	boundClient := h.pool.clients[clientIdx]
@@ -1175,6 +1220,9 @@ func mapUpstreamError(err error) (int, string) {
 	if errors.Is(err, errNoLiveAccount) {
 		return http.StatusServiceUnavailable, errNoLiveAccount.Error()
 	}
+	if errors.Is(err, errDailyLimit) {
+		return http.StatusServiceUnavailable, errDailyLimit.Error()
+	}
 	var ae *deepseek.APIError
 	if errors.As(err, &ae) {
 		switch {
@@ -1194,6 +1242,18 @@ func mapUpstreamError(err error) (int, string) {
 // to preserve context; only the read-time cooldown and QPM token bucket provide
 // back-pressure.
 func (h *Handler) chatWithRetry(ctx context.Context, conv *Conversation, input deepseek.CompletionInput, cb *deepseek.StreamCallbacks) error {
+	// Daily quota: count this request against the serving account so the
+	// rotation skips it once the budget is spent (counted once per request,
+	// not per 429 retry).
+	if h.usage != nil && h.cfg.DailyRequestLimit > 0 {
+		idx := h.pool.IndexOf(conv.Client)
+		if idx >= 0 {
+			mask := maskToken(h.pool.clients[idx].Token)
+			if total := h.usage.Use(mask); total == h.cfg.DailyRequestLimit {
+				log.Printf("chat: account #%d/%d hit its daily limit (%d); fresh sessions now route around it", idx+1, len(h.pool.clients), total)
+			}
+		}
+	}
 	// Account-level backoff: each 429 seen on this account escalates the
 	// pool-wide cooldown for it (so later requests route around it); a
 	// success clears the escalation.
@@ -1290,7 +1350,18 @@ func (h *Handler) recordRequestTime(client *deepseek.Client) {
 // sending the next message. This creates a natural inter-request rhythm
 // on top of the QPM token bucket. Agent tool loops are machine-paced, so
 // their "reading" wait is capped to keep the loop responsive.
+//
+// LONG_PAUSE_CHANCE additionally rolls a dice per request: with that
+// probability the wait stretches into a 20–60s "stepped away from the
+// keyboard" pause — a long-tail human habit (checked the phone, read the
+// mail) that makes the request rhythm even less machine-like. Skipped for
+// agent tool loops, which must stay responsive.
 func (h *Handler) enforceReadTimeCooldown(client *deepseek.Client, toolLoop bool) {
+	if !toolLoop && h.cfg.LongPauseChance > 0 && rand2.Float64() < h.cfg.LongPauseChance {
+		pause := time.Duration(rand2.Int63n(40*int64(time.Second))) + 20*time.Second // 20–60s
+		log.Printf("chat: human-like long pause before upstream request: %s", pause)
+		time.Sleep(pause)
+	}
 	if h.cfg.RequestReadTimeMin <= 0 && h.cfg.RequestReadTimeMax <= 0 {
 		return
 	}

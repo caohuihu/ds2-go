@@ -167,6 +167,8 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | `HEALTH_PROBE_DEAD_RETRY` | `10m` | 对被隔离账号的重试间隔（token 换新后自动复活） |
 | `HEALTH_LOG_FILE` | 同 `LOG_FILE` 目录 | 检测日志文件：隔离/复活/摘要事件，token 只显示掩码；留空默认与主日志同目录（如 `/app/logs/deepseek-health.log`） |
 | `BAN_QUARANTINE_HOURS` | `168` | Hold window for a BAN-detected account (0 = hold until a probe succeeds). 429 account-level backoff is built in, needs no config |
+| `DAILY_REQUEST_LIMIT` | `0` | Per-account daily request budget (resets by local date, counters persisted across restarts); 0 = unlimited. When every account is spent, new sessions 503 until midnight; cached sessions are unaffected |
+| `LONG_PAUSE_CHANCE` | `0` | Per-request probability of an extra 20–60s human-like pause (agent tool loops are exempt); 0 = off |
 | `TOOL_JSON_FALLBACK` | `false` | Sniff unmarked bare JSON as tool calls (double criterion: name in whitelist AND has arguments); opt-in |
 | `REASONING_FALLBACK` | `true` | Promote thinking text to content when the reply body is empty |
 | `CONV_FINGERPRINT_ROUTE` | `false` | Route by conversation-opening fingerprint: first turn of a new task gets a fresh session on the next round-robin account; in-progress tasks re-attach to their own session/account |
@@ -191,6 +193,21 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 - **Round-robin fix.** Unbound prefixes previously resolved to account 0
   (Go's map zero value), pinning every new session to the first account; new
   sessions now genuinely rotate across all live accounts.
+- **Load-aware selection.** When a prefix needs re-binding (unbound, its
+  account died, or its daily quota is spent) the pool picks the *least
+  busy* live account — fewest in-flight completions — with round-robin
+  breaking ties, so new traffic no longer queues behind the busiest account.
+- **Daily quota** (`DAILY_REQUEST_LIMIT`, default off). Each account's
+  requests are counted per local day and persisted to
+  `<DATA_DIR>/daily-usage.json` (restart-safe, resets at midnight). An
+  account at its budget is skipped by new-session selection; when *all* are
+  spent, new sessions fail fast with 503 until midnight while cached
+  sessions keep working.
+- **Human-like long pause** (`LONG_PAUSE_CHANCE`, default off). With that
+  probability any request (agent tool loops exempt) waits an extra random
+  20–60 s before hitting upstream — a "stepped away" long tail on top of the
+  5–30 s read-time cooldown, making the per-account request rhythm harder
+  to fingerprint as machine-paced.
 - **Multi-client isolation** (`PROXY_KEYS_FILE`, active with ≥2 keys). Give each
   client a distinct proxy key (e.g. SiYuan uses key 1, opencode uses key 2). The
   key's stable id is mixed into the **prefix and fingerprint keys**, so distinct

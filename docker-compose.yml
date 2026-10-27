@@ -44,6 +44,10 @@ services:
       - HEALTH_PROBE_DEAD_RETRY=${HEALTH_PROBE_DEAD_RETRY:-10m}
       # 封禁熔断：检测到封禁措辞的账号隔离保持时长（小时，0=长期保持）
       - BAN_QUARANTINE_HOURS=${BAN_QUARANTINE_HOURS:-168}
+      # 日配额：每账号每日请求上限（0=不限；计数落盘 ./data/daily-usage.json）
+      - DAILY_REQUEST_LIMIT=${DAILY_REQUEST_LIMIT:-0}
+      # 拟人长停顿：每个请求有该概率额外随机等待 20–60s（0=关）
+      - LONG_PAUSE_CHANCE=${LONG_PAUSE_CHANCE:-0}
       # 工具调用解析 / 思考兜底
       - TOOL_JSON_FALLBACK=${TOOL_JSON_FALLBACK:-false}
       - REASONING_FALLBACK=${REASONING_FALLBACK:-true}

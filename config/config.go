@@ -38,6 +38,8 @@ type Config struct {
 	HealthProbeInterval     time.Duration // how often to actively probe live accounts (0 = disabled, default 30m)
 	HealthProbeDeadRetry    time.Duration // how often to re-probe quarantined accounts (0 = disabled, default 10m)
 	BanQuarantineHours      int           // how long to hold a BAN-detected account (0 = hold until a probe succeeds, default 168 = 7d)
+	DailyRequestLimit       int           // per-account daily request quota (0 = unlimited, default 0)
+	LongPauseChance         float64       // chance that a request waits an extra 20–60s human-like pause (0 = off, default 0)
 	HealthLogFile           string        // dedicated token-health log file; empty = events go to main log only
 	StartupAccountCheck     bool          // probe all accounts once before serving (default true)
 	ToolJSONFallback        bool          // sniff unmarked bare JSON as tool calls (double-criteria; default false)
@@ -82,6 +84,8 @@ func Load() (*Config, error) {
 		HealthProbeInterval:     parseDurationEnv("HEALTH_PROBE_INTERVAL", 30*time.Minute),
 		HealthProbeDeadRetry:    parseDurationEnv("HEALTH_PROBE_DEAD_RETRY", 10*time.Minute),
 		BanQuarantineHours:      parseIntEnv("BAN_QUARANTINE_HOURS", 168),
+		DailyRequestLimit:       parseIntEnv("DAILY_REQUEST_LIMIT", 0),
+		LongPauseChance:         parseFloatEnv("LONG_PAUSE_CHANCE", 0),
 		HealthLogFile:           env("HEALTH_LOG_FILE", ""),
 		StartupAccountCheck:     parseBoolEnv("STARTUP_ACCOUNT_CHECK", true),
 		ToolJSONFallback:        parseBoolEnv("TOOL_JSON_FALLBACK", false),

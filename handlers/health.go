@@ -19,6 +19,11 @@ import (
 // quarantined (tokens expired) and nobody can serve a request.
 var errNoLiveAccount = errors.New("all deepseek accounts are quarantined (tokens expired); refresh accounts.txt and restart")
 
+// errDailyLimit is returned when every live account has already spent its
+// DAILY_REQUEST_LIMIT budget for today; new sessions wait until midnight
+// (existing cached sessions keep working on their bound accounts).
+var errDailyLimit = errors.New("all live deepseek accounts reached their daily request limit (DAILY_REQUEST_LIMIT); retry after midnight or raise the limit")
+
 // ---- AccountPool quarantine state ----
 //
 // The pool (defined in handler.go) carries a dead map: quarantined account

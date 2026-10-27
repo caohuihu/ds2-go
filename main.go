@@ -56,6 +56,14 @@ func main() {
 	defer stopProbe()
 	hc.Start(probeCtx, cfg.HealthProbeInterval, cfg.HealthProbeDeadRetry)
 
+	// Daily quota (DAILY_REQUEST_LIMIT): per-account request counters,
+	// persisted so a restart does not reset the day's budget.
+	if cfg.DailyRequestLimit > 0 {
+		usage := handlers.NewUsageTracker(filepath.Join(cfg.DataDir, "daily-usage.json"))
+		defer usage.Close()
+		h.SetUsageTracker(usage)
+	}
+
 	// Session persistence (PERSIST_SESSIONS): restore the conversation index
 	// from the data file so long-running client tasks survive a restart, and
 	// wire every store removal to a throttled re-persist.
@@ -126,6 +134,12 @@ func main() {
 		}
 		if cfg.PersistSessions {
 			log.Printf("  session persistence    : ON (%s)", filepath.Join(cfg.DataDir, "conversations.json"))
+		}
+		if cfg.DailyRequestLimit > 0 {
+			log.Printf("  daily request limit    : %d/account (persisted: %s)", cfg.DailyRequestLimit, filepath.Join(cfg.DataDir, "daily-usage.json"))
+		}
+		if cfg.LongPauseChance > 0 {
+			log.Printf("  human-like long pause  : %.0f%% of requests wait an extra 20–60s (agent loops exempt)", cfg.LongPauseChance*100)
 		}
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %v", err)

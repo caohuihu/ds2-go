@@ -46,6 +46,21 @@ func (l *AccountLimiter) Wait(deviceID string, qpm, maxConcurrent int) (release 
 	}
 }
 
+// InFlight reports how many completion requests are currently executing on
+// this account (semaphore slots in use). Request-picking can use it to
+// spread new traffic across accounts instead of piling onto the busy one.
+func (l *AccountLimiter) InFlight(deviceID string) int {
+	l.mu.Lock()
+	b, ok := l.buckets[deviceID]
+	l.mu.Unlock()
+	if !ok {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return cap(b.sem) - len(b.sem)
+}
+
 func (l *AccountLimiter) getBucket(deviceID string, qpm, maxConcurrent int) *accountBucket {
 	l.mu.Lock()
 	defer l.mu.Unlock()
