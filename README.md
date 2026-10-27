@@ -133,13 +133,9 @@ Or with Compose:
 PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --build
 ```
 
-## Configuration
+> **Risk-hardened preset**: for long-running, multi-account deployments, copy `.env.risk-hardened.example` to `.env` — three layers of fraud protection (human-like behavior / per-account quota + breaker / task binding with zero replay) plus a 30m risk log; values and rationale are commented in the file.
 
-> **Anti-fraud preset.** For long-running multi-account deployments, copy
-> `.env.risk-hardened.example` to `.env` instead of filling the table by hand —
-> it pre-fills the full three-layer defense (human-like pacing / per-account
-> quota + BAN breaker / task binding with zero replay) plus a 30-minute risk
-> summary log, with per-value rationale in the file.
+## Configuration
 
 | Variable | Default | Description |
 | --- | --- | --- |
