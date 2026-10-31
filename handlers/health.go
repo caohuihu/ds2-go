@@ -28,7 +28,8 @@ var errDailyLimit = errors.New("all live deepseek accounts reached their daily r
 //
 // The pool (defined in handler.go) carries a dead map: quarantined account
 // index → reason. An account is quarantined only on upstream auth failures
-// (401/403) — never on 429, 5xx or network errors, which are transient.
+// (HTTP 401/403 or the HTTP-200 envelope form, deepseek.IsAuthFailure) —
+// never on 429, 5xx or network errors, which are transient.
 
 // IsDead reports whether the account at idx is quarantined.
 func (p *AccountPool) IsDead(idx int) bool {
@@ -323,7 +324,9 @@ func probeLabel(pool *AccountPool, idx int) string {
 }
 
 // ProbeAccount checks one account. Success revives a quarantined account;
-// 401/403 quarantines it; transient errors leave the state unchanged.
+// an auth failure (HTTP 401/403 or the HTTP-200 envelope form, see
+// deepseek.IsAuthFailure) quarantines it; transient errors leave the
+// state unchanged.
 func (hc *HealthChecker) ProbeAccount(idx int) {
 	p := hc.pool
 	if idx < 0 || idx >= len(p.clients) {
@@ -342,8 +345,14 @@ func (hc *HealthChecker) ProbeAccount(idx int) {
 		} else {
 			hc.event("probe", label+" OK")
 		}
-	case errors.As(err, &ae) && (ae.HTTPStatus == 401 || ae.HTTPStatus == 403):
-		reason := fmt.Sprintf("upstream http %d", ae.HTTPStatus)
+	case deepseek.IsAuthFailure(err):
+		reason := "upstream auth failure (token invalid or expired)"
+		switch {
+		case errors.As(err, &ae) && (ae.HTTPStatus == 401 || ae.HTTPStatus == 403):
+			reason = fmt.Sprintf("upstream http %d", ae.HTTPStatus)
+		case errors.As(err, &ae) && ae.Code != 0:
+			reason = fmt.Sprintf("upstream code %d: %s", ae.Code, ae.Msg)
+		}
 		if p.Quarantine(idx, reason) {
 			hc.event("probe", fmt.Sprintf("%s EXPIRED (%s) → quarantined", label, reason))
 		} else {
@@ -419,8 +428,9 @@ func (hc *HealthChecker) writeSummary() {
 	hc.event("summary", fmt.Sprintf("total=%d live=%d quarantined=%d%s", len(p.clients), p.LiveCount(), len(dead), extra))
 }
 
-// EventQuarantine is the passive path: a 401/403 observed mid-request
-// quarantines the account so later requests skip it.
+// EventQuarantine is the passive path: an upstream auth failure observed
+// mid-request (401/403 or the HTTP-200 envelope form) quarantines the
+// account so later requests skip it.
 func (hc *HealthChecker) EventQuarantine(idx int, reason string) {
 	p := hc.pool
 	if idx < 0 || idx >= len(p.clients) {

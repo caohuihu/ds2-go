@@ -307,6 +307,13 @@ finding out mid-request:
   quarantines that account immediately. Conversations bound to it are
   migrated to a live account with a full history replay; if *all* accounts
   are dead, requests fail fast with a clear 503.
+- **Expired-token envelope form** — when the web API rejects a dead
+  `userToken` with its HTTP-200 envelope form (`code: 40003 "Authorization
+  Failed (invalid token)"`), the startup check, the periodic probes and the
+  passive path all recognize it via `deepseek.IsAuthFailure` (401/403, or
+  code 40003 / "invalid token" wording) and quarantine the account — the
+  bound session then migrates to a live account automatically instead of
+  failing forever on the dead one.
 - **Account-level 429 backoff** — every 429 seen on an account escalates a
   cross-request cooldown: `60s × 2^(consecutive hits − 1)` (60s → 120s →
   240s … capped at 900s). New sessions route around the cooling account

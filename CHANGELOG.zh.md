@@ -11,6 +11,15 @@
 - **`string` 属性三态**：省略 `string` 属性时值先按 JSON 解析、失败回落字符串（`42` → 数字 `42`，`hello` 保持字符串）；显式 `string="true"` 保持字符串。
 - 非 tools 模式契约不变：残片保持原文（回归测试锁定）。
 
+### token 失效自动隔离（HTTP-200 envelope 形态）
+
+- `accounts.txt` 中 userToken 失效后，上游网页 API 以 **HTTP 200 + envelope `code: 40003 "Authorization Failed (invalid token)"`** 拒绝（PoW 挑战步骤即被拦下）；此前所有检测点只看 HTTP 401/403，坏账号永远"存活"，绑定在它上面的会话（前缀/指纹路由）每次请求都撞死账号、客户端反复拿到空回复。
+- 新增 `deepseek.IsAuthFailure`（`deepseek/client.go`）：HTTP 401/403 **或** code 40003 / "invalid token" 措辞，统一判定鉴权失败。四处接入（`handlers/handler.go` + `handlers/health.go`）：
+  - **请求中被动隔离**：命中即隔离该账号，下个请求 `migrateOffDeadAccount` 把会话迁到活账号全量重放历史；
+  - **启动校验 + 周期探测**：判 EXPIRED 隔离，探测成功即自动复活；
+  - **self-heal 拒绝**：坏 token 不再在同一账号上白重建会话；
+  - **客户端错误码**：鉴权失败返回 401（此前 502）。
+
 ### 静默自动续写 + 风控可观测（参考 webai2api）
 
 - **静默自动续写**（`AUTO_CONTINUATION` + `AUTO_CONTINUATION_MAX`，默认 `false` / `2`，`handlers/handler.go` + `config/config.go`）：上游偶尔返回"成功但静默"的空回复（正文、思考全空——长任务静默卡死的典型形态，如 56 轮 stall）。开启后在**同一网页会话**内自动发送 "Continue" 促动（挂接在空回复的 parent 消息上，`ModelType` 置空表示非首轮），最多连续 `AUTO_CONTINUATION_MAX` 次；续写增量流入同一条回复流，客户端看到无缝衔接的答案。仅在回复**完全为空**且会话**已有 parent 消息**时触发，agent 工具流与任何非空回复都不触发；促动失败只记日志并保留已有部分回复，不会让整个请求失败。续写轮**同样计入** `REQUESTS_PER_SESSION` 与日配额（不豁免）。

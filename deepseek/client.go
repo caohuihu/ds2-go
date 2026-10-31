@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	rand2 "math/rand"
@@ -83,6 +84,27 @@ func (e *APIError) Error() string {
 		return fmt.Sprintf("deepseek api: http %d, code %d: %s", e.HTTPStatus, e.Code, e.Msg)
 	}
 	return fmt.Sprintf("deepseek api: http %d: %s", e.HTTPStatus, e.Msg)
+}
+
+// IsAuthFailure reports whether err is an upstream auth failure: an HTTP
+// 401/403 status, or the envelope form the web API uses when the userToken
+// is invalid or expired — HTTP 200 carrying code 40003 "Authorization
+// Failed (invalid token)". The envelope form is invisible to any check
+// that looks only at HTTP status codes, so all detection points must go
+// through this helper.
+func IsAuthFailure(err error) bool {
+	var ae *APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	if ae.HTTPStatus == 401 || ae.HTTPStatus == 403 {
+		return true
+	}
+	msg := strings.ToLower(ae.Msg)
+	return ae.Code == 40003 ||
+		strings.Contains(msg, "invalid token") ||
+		strings.Contains(msg, "token invalid") ||
+		strings.Contains(msg, "authorization failed")
 }
 
 type envelope struct {

@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 - **Unterminated `<parameter>` values are truncated at the next marker tag**, so residue can no longer pollute a tool argument value.
 - **Tri-state `string` attribute**: when the attribute is omitted the value is parsed as JSON first and falls back to a string (`42` → number, `hello` stays a string); an explicit `string="true"` keeps the raw string.
 - The no-tools contract is unchanged: marker fragments stay ordinary text (regression-tested).
+- **Expired-token detection covers the HTTP-200 envelope form** (`deepseek.IsAuthFailure`, `handlers/handler.go`, `handlers/health.go`): when a `userToken` in `accounts.txt` expires, the web API rejects it with **HTTP 200 + envelope `code: 40003 "Authorization Failed (invalid token)"`** — every detection point checked only HTTP 401/403, so the dead account stayed "live" forever and every session bound to it kept failing. Auth failure is now recognized via `deepseek.IsAuthFailure` (401/403, or code 40003 / "invalid token" wording) in all four places: the passive mid-request quarantine (the session then migrates to a live account with a full history replay), the startup check and periodic probes (EXPIRED → quarantined, revived on first success), the self-heal refusal (no pointless same-account recreate), and the client-facing error code (401 instead of 502).
 
 ### Added
 

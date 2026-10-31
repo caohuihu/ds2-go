@@ -198,6 +198,7 @@ DeepSeek 网页 token 会静默失效。本代理主动检测，而不是等到�
 - **启动校验**：服务启动、开始监听前，对每个账号做一次无副作用的鉴权探测（PoW-challenge 拉取）。失效账号当场隔离。
 - **周期探测**：每 `HEALTH_PROBE_INTERVAL`（默认 30m）重探全部存活账号；被隔离账号每 `HEALTH_PROBE_DEAD_RETRY`（默认 10m）重试一次，token 换新后无需重启即自动复活。
 - **使用中被动隔离**：真实补全请求里一旦看到 401/403，立刻隔离该账号；绑定在它上面的会话会被迁移到存活账号并全量重放历史；若所有账号都失效，请求快速失败并返回清晰的 503。
+- **token 失效的 envelope 形态**：网页 API 拒绝坏 `userToken` 时可能返回 **HTTP 200 + envelope `code: 40003 "Authorization Failed (invalid token)"`**（此前只看 401/403 会漏掉，坏账号永远"存活"、绑定会话反复失败）。现由 `deepseek.IsAuthFailure` 统一判定（401/403，或 code 40003 / "invalid token" 措辞），启动校验、周期探测、被动隔离三处全部接入：坏账号被隔离后，绑定会话自动迁到活账号，客户端错误码也改为 401。
 - **检测日志**：每次隔离/复活以及一条滚动摘要都追加到 `HEALTH_LOG_FILE`。留空时默认与主日志同目录（`LOG_FILE=/app/logs/app.log` → `/app/logs/deepseek-health.log`），一个文件夹里 `tail -f` 两个文件即可。token 一律只打印掩码（`ab12cd…ef90`），文件可安全保留：
 
   ```

@@ -88,8 +88,9 @@ type AccountPool struct {
 	clients []*deepseek.Client
 	next    atomic.Uint64
 	// mu protects dead: quarantined account index → reason. Quarantine
-	// happens only on upstream auth failures (401/403), never on 429, 5xx
-	// or network errors. See health.go for the state-machine methods.
+	// happens only on upstream auth failures (HTTP 401/403 or the
+	// HTTP-200 envelope form, see deepseek.IsAuthFailure), never on 429,
+	// 5xx or network errors. See health.go for the state-machine methods.
 	// It also protects rateHits (429 escalations) and cooldownUntil
 	// (account-level rate backoff) and banUntil (BAN hold).
 	mu            sync.Mutex
@@ -634,7 +635,9 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	// BAN detection first: an upstream ban ("账号已被封禁", "banned", …) is not
 	// an expiring token — retrying a banned account only makes the ban worse,
 	// so it is held out of rotation for BanQuarantineHours (0 = until a
-	// probe succeeds). Only 401/403 without ban wording are token problems.
+	// probe succeeds). Auth failures (HTTP 401/403 or the HTTP-200
+	// envelope form code 40003 "Authorization Failed (invalid token)")
+	// without ban wording are token problems.
 	if err != nil {
 		if idx := h.pool.IndexOf(conv.Client); idx >= 0 {
 			if kw := banKeyword(err); kw != "" {
@@ -651,15 +654,19 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 				if h.health != nil {
 					h.health.EventQuarantine(idx, reason)
 				}
-			} else {
+			} else if deepseek.IsAuthFailure(err) {
 				var ae *deepseek.APIError
-				if errors.As(err, &ae) && (ae.HTTPStatus == 401 || ae.HTTPStatus == 403) {
-					reason := fmt.Sprintf("upstream http %d during completion", ae.HTTPStatus)
-					if h.health != nil {
-						h.health.EventQuarantine(idx, reason)
-					} else {
-						h.pool.Quarantine(idx, reason)
-					}
+				reason := "upstream auth failure (token invalid or expired)"
+				switch {
+				case errors.As(err, &ae) && (ae.HTTPStatus == 401 || ae.HTTPStatus == 403):
+					reason = fmt.Sprintf("upstream http %d during completion", ae.HTTPStatus)
+				case errors.As(err, &ae) && ae.Code != 0:
+					reason = fmt.Sprintf("upstream auth failure (code %d: %s)", ae.Code, ae.Msg)
+				}
+				if h.health != nil {
+					h.health.EventQuarantine(idx, reason)
+				} else {
+					h.pool.Quarantine(idx, reason)
 				}
 			}
 		}
@@ -1225,8 +1232,9 @@ var errRequestAborted = errors.New("request aborted before completion")
 // It refuses to fire for: success, streaming responses (the client has
 // already received partial deltas), disabled persistence, fresh sessions
 // (there is nothing cached to have died), aborted requests (client gone),
-// and auth/rate-limit API errors (401/403 → quarantine+migrate; 429 →
-// backoff, not a dead session).
+// and auth/rate-limit API errors (auth failures → quarantine+migrate, not
+// a dead session; 429 → backoff, not a dead session). Auth failures
+// include the HTTP-200 envelope form (deepseek.IsAuthFailure).
 func shouldSelfHeal(err error, stream, enabled, isFresh, clientGone bool) bool {
 	if err == nil || stream || !enabled || isFresh || clientGone {
 		return false
@@ -1234,8 +1242,11 @@ func shouldSelfHeal(err error, stream, enabled, isFresh, clientGone bool) bool {
 	if errors.Is(err, errRequestAborted) {
 		return false
 	}
+	if deepseek.IsAuthFailure(err) {
+		return false
+	}
 	var ae *deepseek.APIError
-	if errors.As(err, &ae) && (ae.HTTPStatus == 401 || ae.HTTPStatus == 403 || ae.HTTPStatus == 429) {
+	if errors.As(err, &ae) && ae.HTTPStatus == 429 {
 		return false
 	}
 	return true
@@ -1284,7 +1295,7 @@ func mapUpstreamError(err error) (int, string) {
 	var ae *deepseek.APIError
 	if errors.As(err, &ae) {
 		switch {
-		case ae.HTTPStatus == 401 || ae.HTTPStatus == 403:
+		case deepseek.IsAuthFailure(err):
 			return http.StatusUnauthorized, "deepseek rejected the configured token (invalid or expired)"
 		case ae.HTTPStatus == 429:
 			return http.StatusTooManyRequests, "deepseek rate limited this account; retry later"
