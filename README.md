@@ -272,6 +272,14 @@ simulates it at the text layer (the same approach webai2api uses):
   session.
 - `tool_choice`: `auto` (default), `none` (tools ignored), `required`, or
   `{"type":"function","function":{"name":"..."}}`.
+- The parser tolerates the upstream's *degraded* marker forms: when the web
+  UI drops the leading `<` of a marker (shipping `｜｜DSML｜｜ calls>` or
+  `</｜｜DSML｜｜ invoke name="...">` as-is), tools mode strips the
+  calls-layer residue, corrects close-shaped openers that carry a `name=`
+  attribute, and cuts unterminated parameter values at the next marker — so
+  residue never leaks into content or argument values; plain chat (no tools)
+  keeps such text intact. On a stream cut the detector recovers the last
+  plain-text tail it was withholding (≤64 bytes, marker fragments trimmed).
 - Unknown tool names emitted by the model are dropped (strict mode), not
   forwarded to the agent.
 - Argument keys the model gets wrong are corrected against the schema when a

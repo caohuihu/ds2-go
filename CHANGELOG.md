@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Robust tool-marker parsing** (port of webai2api v0.1.51 audit, `handlers/tools.go`, `handlers/tools_stream.go`): the upstream web UI occasionally drops the leading `<` of a marker, shipping residue like `｜｜DSML｜｜ calls>` or `</｜｜DSML｜｜ invoke name="...">`. Every DSML regex was `<`-anchored, so the residue leaked into reply content. In tools mode the scanner now recognizes `<`-less openers; calls-layer fragments are stripped in place (half invoke blocks stay conservatively dropped, per the existing contract); a close-shaped opener carrying a `name=` attribute is corrected to an opener; and on stream cuts the withheld SCAN-state tail is recovered (`recoverTextOnCut`) with a marker-fragment trim (≤64 chars, markdown tables untouched), so the client keeps the last plain-text chunk before a cut.
+- **Unterminated `<parameter>` values are truncated at the next marker tag**, so residue can no longer pollute a tool argument value.
+- **Tri-state `string` attribute**: when the attribute is omitted the value is parsed as JSON first and falls back to a string (`42` → number, `hello` stays a string); an explicit `string="true"` keeps the raw string.
+- The no-tools contract is unchanged: marker fragments stay ordinary text (regression-tested).
+
 ### Added
 
 - **Silent-reply auto-continuation** (`handlers/handler.go`, `config/config.go`)

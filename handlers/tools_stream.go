@@ -118,13 +118,40 @@ func (d *streamingToolDetector) finalize() []streamAction {
 			actions = append(actions, streamAction{kind: actionToolCalls, calls: calls})
 		}
 	default:
-		actions = append(actions, streamAction{kind: actionText, text: d.buf})
+		// SCAN residue: plain text that was withheld (an unclosed "<" or
+		// a degraded marker fragment may still have completed); trim a
+		// trailing marker fragment so residue never ships as content.
+		text := d.buf
+		if m := markerTailRE.FindIndex([]byte(text)); m != nil {
+			text = text[:m[0]]
+		}
+		if text != "" {
+			actions = append(actions, streamAction{kind: actionText, text: text})
+		}
 	}
 
 	d.buf = ""
 	d.state = detScan
 	d.closed = true
 	return actions
+}
+
+// recoverTextOnCut releases the text held back in SCAN state when the
+// stream cuts: the withheld tail is ordinary prose that may carry an
+// incomplete marker fragment; the fragment is trimmed, the rest is
+// returned for emission. DSML/SENTINEL/JSON state holds a half tool
+// call, which is dropped — a continuation turn resends it.
+func (d *streamingToolDetector) recoverTextOnCut() string {
+	if d.state != detScan || d.buf == "" {
+		d.buf = ""
+		return ""
+	}
+	tail := d.buf
+	d.buf = ""
+	if m := markerTailRE.FindIndex([]byte(tail)); m != nil {
+		tail = tail[:m[0]]
+	}
+	return tail
 }
 
 // ---- SCAN ----
@@ -150,6 +177,12 @@ func (d *streamingToolDetector) stepScan(actions *[]streamAction) bool {
 		if dsmlNoiseRE.MatchString(prefix) {
 			prefix = dsmlNoiseRE.ReplaceAllString(prefix, "")
 		}
+		// degraded calls-opener fragments: tools mode only (the upstream
+		// UI eats the "<" that produced them; without tools such text
+		// stays intact)
+		if !d.requireMarker && dsmlOrphanOpenRE.MatchString(prefix) {
+			prefix = dsmlOrphanOpenRE.ReplaceAllString(prefix, "")
+		}
 		if prefix != "" {
 			*actions = append(*actions, streamAction{kind: actionText, text: prefix})
 		}
@@ -158,6 +191,17 @@ func (d *streamingToolDetector) stepScan(actions *[]streamAction) bool {
 
 	switch kind {
 	case "dsml_open":
+		// A degraded calls-layer fragment ("｜｜DSML｜｜ calls>", leading
+		// "<" eaten by the upstream UI) is residue: strip it instead of
+		// holding the stream. A real block's invoke opers are still
+		// detected downstream. "<"-anchored openers and invoke-level
+		// opers enter the DSML hold state.
+		if d.buf[0] != '<' {
+			if m := dsmlOrphanOpenRE.FindStringIndex(d.buf); m != nil && m[0] == 0 {
+				d.buf = d.buf[m[1]:]
+				return true
+			}
+		}
 		d.state = detDSML
 		return true
 	case "dsml_close":
@@ -190,6 +234,15 @@ func (d *streamingToolDetector) findEarliestScanToken() (int, string) {
 		bestIdx, bestKind = m[0], "dsml_open"
 	}
 
+	// tools mode only: degraded openers (leading "<" dropped by the
+	// upstream UI) are recognized too; in no-tools mode such fragments
+	// stay ordinary text
+	if !d.requireMarker {
+		if m := dsmlDegradedOpenRE.FindStringIndex(d.buf); m != nil && (bestIdx < 0 || m[0] < bestIdx) {
+			bestIdx, bestKind = m[0], "dsml_open"
+		}
+	}
+
 	// orphan closing tags are only stripped in tools mode; without tools
 	// they stay ordinary text
 	if !d.requireMarker {
@@ -211,28 +264,38 @@ func (d *streamingToolDetector) findEarliestScanToken() (int, string) {
 }
 
 // safePrefixLen returns how much of buf can be emitted as plain text.
-// A trailing unclosed "<..." may still become a marker tag, keep it. With
-// the JSON fallback on, a partial JSON anchor prefix is kept too.
+// A trailing unclosed "<..." may still become a marker tag, keep it. A
+// trailing degraded marker fragment (the upstream UI drops the leading
+// "<", so "｜｜DSML｜｜ in" may still complete) is kept too. With the
+// JSON fallback on, a partial JSON anchor prefix is kept as well.
 func (d *streamingToolDetector) safePrefixLen() int {
 	buf := d.buf
 	n := len(buf)
 	if n == 0 {
 		return 0
 	}
+	best := n
 	lower := n - safeKeep
 	if lower < 0 {
 		lower = 0
 	}
+	// an unclosed "<": the tail may still complete into a marker tag
 	for i := n - 1; i >= lower; i-- {
-		if buf[i] == '<' {
-			if !strings.Contains(buf[i:], ">") {
-				return i
-			}
+		if buf[i] == '<' && !strings.Contains(buf[i:], ">") {
+			best = i
 			break
 		}
 	}
+	// a degraded marker fragment: the smell test requires the DSML core
+	// plus a pipe run, so markdown table pipes are never withheld
+	if !d.requireMarker {
+		if m := markerTailRE.FindIndex([]byte(buf[lower:])); m != nil {
+			if p := lower + int(m[0]); p < best {
+				best = p
+			}
+		}
+	}
 	if !d.requireMarker && d.jsonFallback {
-		best := n
 		for _, a := range jsonAnchors {
 			maxK := len(a)
 			if maxK > n {
@@ -247,11 +310,8 @@ func (d *streamingToolDetector) safePrefixLen() int {
 				}
 			}
 		}
-		if best < n {
-			return best
-		}
 	}
-	return n
+	return best
 }
 
 // ---- DSML ----

@@ -163,15 +163,49 @@ var dsmlMarkRE = `[|\x{FF5C}]+\s*DSML\s*[|\x{FF5C}]+`
 const tagAttrsRE = `(?:"[^"]*"|'[^']*'|[^>"'])*`
 
 var (
-	dsmlCallsOpenRE   = regexp.MustCompile(`(?i)<\s*` + dsmlMarkRE + `\s*calls\b` + tagAttrsRE + `>`)
-	dsmlCallsCloseRE  = regexp.MustCompile(`(?i)</\s*` + dsmlMarkRE + `\s*calls\s*>`)
-	dsmlInvokeOpenRE  = regexp.MustCompile(`(?i)<\s*` + dsmlMarkRE + `\s*invoke\b(` + tagAttrsRE + `)>`)
+	// dsmlCallsOpenRE is degraded-tolerant: the upstream web UI sometimes
+	// eats the leading "<" of a marker, delivering "｜｜DSML｜｜ calls>"
+	// (even "</...calls>") directly to the stream, so the opener is only
+	// optionally "<"-anchored.
+	dsmlCallsOpenRE = regexp.MustCompile(`(?i)(?:</?)?\s*` + dsmlMarkRE + `\s*calls\b` + tagAttrsRE + `>`)
+	dsmlCallsCloseRE = regexp.MustCompile(`(?i)</\s*` + dsmlMarkRE + `\s*calls\s*>`)
+	dsmlInvokeOpenRE = regexp.MustCompile(`(?i)<\s*` + dsmlMarkRE + `\s*invoke\b(` + tagAttrsRE + `)>`)
 	dsmlInvokeCloseRE = regexp.MustCompile(`(?i)</\s*` + dsmlMarkRE + `\s*invoke\s*>`)
-	dsmlParamOpenRE   = regexp.MustCompile(`(?i)<\s*` + dsmlMarkRE + `\s*parameter\b(` + tagAttrsRE + `)>`)
-	dsmlParamCloseRE  = regexp.MustCompile(`(?i)</\s*` + dsmlMarkRE + `\s*parameter\s*>`)
-	dsmlAttrPairRE    = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))`)
-	dsmlAnyOpenRE     = regexp.MustCompile(`(?i)<\s*` + dsmlMarkRE + `\s*(?:calls|invoke)\b`)
-	dsmlNoiseRE       = regexp.MustCompile(`(?i)</\s*` + dsmlMarkRE + `\s*(?:calls|invoke|parameter)\s*>`)
+	dsmlParamOpenRE = regexp.MustCompile(`(?i)<\s*` + dsmlMarkRE + `\s*parameter\b(` + tagAttrsRE + `)>`)
+	dsmlParamCloseRE = regexp.MustCompile(`(?i)</\s*` + dsmlMarkRE + `\s*parameter\s*>`)
+	dsmlAttrPairRE = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))`)
+	// dsmlAnyOpenRE scans for any marker start; strict "<"-anchored form.
+	dsmlAnyOpenRE = regexp.MustCompile(`(?i)<\s*` + dsmlMarkRE + `\s*(?:calls|invoke)\b`)
+	// dsmlDegradedOpenRE additionally tolerates the leading "<" being absent
+	// (the upstream UI drops it, delivering "｜｜DSML｜｜ calls>" or
+	// "</...calls>"); used in tools mode only, so plain chat stays intact.
+	dsmlDegradedOpenRE = regexp.MustCompile(`(?i)(?:</?)?\s*` + dsmlMarkRE + `\s*(?:calls|invoke)\b`)
+	// dsmlCallsOpenStrictRE is the "<"-anchored opener for no-tools mode,
+	// where degraded forms must stay ordinary text.
+	dsmlCallsOpenStrictRE = regexp.MustCompile(`(?i)<\s*` + dsmlMarkRE + `\s*calls\b` + tagAttrsRE + `>`)
+	dsmlNoiseRE = regexp.MustCompile(`(?i)</\s*` + dsmlMarkRE + `\s*(?:calls|invoke|parameter)\s*>`)
+
+	// dsmlOrphanOpenRE is a calls-layer opener fragment, with or without
+	// the leading "<" — degraded residue like "｜｜DSML｜｜ calls>" that
+	// the upstream UI shipped when it swallowed the "<". Only the calls
+	// layer is scrubbed: a half invoke/parameter block is a conservative
+	// drop, not a strip (contract: incomplete blocks stay unstripped).
+	dsmlOrphanOpenRE = regexp.MustCompile(`(?i)(?:</?)?\s*` + dsmlMarkRE + `\s*(?:calls|tool_calls)\b[^<>\n]{0,40}>`)
+
+	// dsmlMalformedOpenRE is an opener written in close shape:
+	// "</｜｜DSML｜｜ invoke name=\"read\">". Accepted only when it carries a
+	// name= attribute, so a genuine close "</...invoke>" is untouched.
+	dsmlMalformedOpenRE = regexp.MustCompile(`(?i)</\s*` + dsmlMarkRE + `\s*invoke\b(` + tagAttrsRE + `)>`)
+	nameAttrRE = regexp.MustCompile(`(?i)\bname\s*=`)
+
+	// markerTailRE matches an incomplete marker fragment stuck at the very
+	// end of held text ("｜｜DSML｜｜ in"). It requires the DSML core plus
+	// a pipe run, so markdown table pipes and ordinary prose are safe.
+	markerTailRE = regexp.MustCompile(`(?i)(?:</?)?\s*[|\x{FF5C}]+\s*DSML(?:\s*[|\x{FF5C}])*\s*[a-z]{0,16}$`)
+
+	// dsmlNextTagRE locates the next marker tag of any kind; used to cut
+	// unterminated parameter values before residue can leak into them.
+	dsmlNextTagRE = regexp.MustCompile(`(?i)(?:</?)?\s*` + dsmlMarkRE + `\s*(?:calls|tool_calls|invoke|parameter)\b`)
 )
 
 // dsmlFull is the marker used inside prompts (full-width native prior).
@@ -499,8 +533,12 @@ func parseDSMLAttrs(s string) map[string]string {
 	return res
 }
 
-func decodeDSMLValue(raw string, isString bool) any {
-	if isString {
+// decodeDSMLValue decodes a DSML parameter value. The string attribute is
+// tri-state: an explicit true-ish value forces a string; when it is
+// omitted or false-ish, JSON is tried first and the raw string is kept as
+// fallback (so "42" becomes 42 while "hello" stays "hello").
+func decodeDSMLValue(raw string, hasString bool, stringAttr string) any {
+	if hasString && (stringAttr == "" || stringAttr == "true" || stringAttr == "1" || stringAttr == "yes") {
 		return raw
 	}
 	s := strings.TrimSpace(raw)
@@ -513,6 +551,28 @@ func decodeDSMLValue(raw string, isString bool) any {
 	return raw
 }
 
+// findInvokeOpen returns the earliest invoke open at or after `from`,
+// tolerating the malformed close-shaped opener (accepted only when it
+// carries a name= attribute, so real closes are untouched).
+func findInvokeOpen(body string, from int) (start, end int, attrs string, found bool) {
+	if m := dsmlInvokeOpenRE.FindSubmatchIndex([]byte(body[from:])); m != nil {
+		start, end, found = from+m[0], from+m[1], true
+		if m[2] >= 0 {
+			attrs = body[from+m[2] : from+m[3]]
+		}
+	}
+	if m := dsmlMalformedOpenRE.FindSubmatchIndex([]byte(body[from:])); m != nil && (!found || from+m[0] < start) {
+		attrsStr := ""
+		if m[2] >= 0 {
+			attrsStr = body[from+m[2] : from+m[3]]
+		}
+		if nameAttrRE.MatchString(attrsStr) {
+			start, end, attrs, found = from+m[0], from+m[1], attrsStr, true
+		}
+	}
+	return
+}
+
 // parseDSMLBody parses the invoke blocks inside a DSML calls body.
 func parseDSMLBody(body string, tools []toolDef) []ToolCall {
 	var calls []ToolCall
@@ -521,14 +581,9 @@ func parseDSMLBody(body string, tools []toolDef) []ToolCall {
 	}
 	pos := 0
 	for {
-		idx := dsmlInvokeOpenRE.FindSubmatchIndex([]byte(body[pos:]))
-		if idx == nil {
+		openStart, openEnd, attrsStr, ok := findInvokeOpen(body, pos)
+		if !ok {
 			break
-		}
-		openStart, openEnd := pos+idx[0], pos+idx[1]
-		attrsStr := ""
-		if idx[2] >= 0 {
-			attrsStr = body[pos+idx[2] : pos+idx[3]]
 		}
 		attrs := parseDSMLAttrs(attrsStr)
 		name := attrs["name"]
@@ -564,8 +619,7 @@ func parseDSMLBody(body string, tools []toolDef) []ToolCall {
 			}
 			pAttrs := parseDSMLAttrs(pAttrsStr)
 			pName := pAttrs["name"]
-			sv := pAttrs["string"]
-			isString := sv == "" || sv == "true" || sv == "1" || sv == "yes"
+			sv, hasString := pAttrs["string"]
 
 			var rawValue string
 			var pnext int
@@ -573,12 +627,17 @@ func parseDSMLBody(body string, tools []toolDef) []ToolCall {
 				rawValue = inner[pEnd : pEnd+pcidx[0]]
 				pnext = pEnd + pcidx[1]
 			} else {
-				// unterminated parameter: consume to the end of the invoke
+				// unterminated parameter: stop at the next marker tag so
+				// residue (incl. degraded "<"-less forms) can't leak into
+				// the value
 				rawValue = inner[pEnd:]
+				if m := dsmlNextTagRE.FindStringIndex(rawValue); m != nil {
+					rawValue = rawValue[:m[0]]
+				}
 				pnext = len(inner)
 			}
 			if pName != "" {
-				arguments[pName] = decodeDSMLValue(rawValue, isString)
+				arguments[pName] = decodeDSMLValue(rawValue, hasString, sv)
 			}
 			if pnext <= ppos {
 				pnext = ppos + 1
@@ -679,8 +738,15 @@ func parseJSONCalls(raw string, tools []toolDef) []ToolCall {
 
 // tryDSML locates and parses a DSML block in its three tolerated shapes.
 func tryDSML(text string, tools []toolDef) ([]ToolCall, string) {
+	// Degraded forms (leading "<" dropped) are only tolerated in tools
+	// mode: without tools the marker protocol was never taught, so such
+	// fragments stay ordinary text.
+	openRE := dsmlCallsOpenStrictRE
+	if len(tools) > 0 {
+		openRE = dsmlCallsOpenRE
+	}
 	// Shape 1: complete <calls> ... </calls>
-	open := dsmlCallsOpenRE.FindStringIndex(text)
+	open := openRE.FindStringIndex(text)
 	if open != nil {
 		afterOpen := open[1]
 		if cidx := dsmlCallsCloseRE.FindStringIndex(text[afterOpen:]); cidx != nil {
@@ -710,29 +776,28 @@ func tryDSML(text string, tools []toolDef) ([]ToolCall, string) {
 
 	// Shape 2: calls close without a calls open
 	if cidx := dsmlCallsCloseRE.FindStringIndex(text); cidx != nil {
-		inv := dsmlInvokeOpenRE.FindStringIndex(text[:cidx[0]])
-		if inv != nil {
-			body := text[inv[0]:cidx[0]]
+		if s, _, _, ok := findInvokeOpen(text[:cidx[0]], 0); ok {
+			body := text[s:cidx[0]]
 			if calls := parseDSMLBody(body, tools); len(calls) > 0 {
-				clean := strings.TrimSpace(text[:inv[0]] + text[cidx[1]:])
+				clean := strings.TrimSpace(text[:s] + text[cidx[1]:])
 				return calls, clean
 			}
 		}
 	}
 
 	// Shape 3: bare invoke(s)
-	if inv := dsmlInvokeOpenRE.FindStringIndex(text); inv != nil {
-		body := text[inv[0]:]
+	if s, _, _, ok := findInvokeOpen(text, 0); ok {
+		body := text[s:]
 		if calls := parseDSMLBody(body, tools); len(calls) > 0 {
 			lastClose := -1
-			for _, m := range dsmlInvokeCloseRE.FindAllStringIndex(text[inv[0]:], -1) {
-				lastClose = inv[0] + m[1]
+			for _, m := range dsmlInvokeCloseRE.FindAllStringIndex(text[s:], -1) {
+				lastClose = s + m[1]
 			}
 			var clean string
 			if lastClose > 0 {
-				clean = strings.TrimSpace(text[:inv[0]] + text[lastClose:])
+				clean = strings.TrimSpace(text[:s] + text[lastClose:])
 			} else {
-				clean = strings.TrimSpace(text[:inv[0]])
+				clean = strings.TrimSpace(text[:s])
 			}
 			return calls, clean
 		}
@@ -768,6 +833,20 @@ func trySentinel(text string, tools []toolDef) ([]ToolCall, string) {
 	return nil, ""
 }
 
+// scrubMarkerResidue removes degraded marker fragments and orphan closing
+// tags from text that will be returned as ordinary content, so residue
+// like "｜｜DSML｜｜ calls>" (leading "<" eaten by the upstream UI) never
+// leaks to the client.
+func scrubMarkerResidue(text string) string {
+	if dsmlOrphanOpenRE.MatchString(text) {
+		text = dsmlOrphanOpenRE.ReplaceAllString(text, "")
+	}
+	if dsmlNoiseRE.MatchString(text) {
+		text = dsmlNoiseRE.ReplaceAllString(text, "")
+	}
+	return text
+}
+
 // parseToolCalls extracts tool calls from a completed reply. Priority:
 // DSML, then sentinel. Marker-less bare JSON is only sniffed when
 // jsonFallback is enabled (opt-in), with a double criterion so ordinary
@@ -777,11 +856,19 @@ func parseToolCalls(text string, tools []toolDef, jsonFallback bool) (calls []To
 	if text == "" {
 		return nil, text
 	}
+	// residue scrubbing is tools-mode only: without tools the marker
+	// protocol was never taught, so fragments stay ordinary text
+	scrub := func(s string) string {
+		if len(tools) == 0 {
+			return s
+		}
+		return scrubMarkerResidue(s)
+	}
 	if c, clean := tryDSML(text, tools); c != nil {
-		return c, clean
+		return c, scrub(clean)
 	}
 	if c, clean := trySentinel(text, tools); c != nil {
-		return c, clean
+		return c, scrub(clean)
 	}
 	if jsonFallback && len(tools) > 0 {
 		allowed := knownToolNames(tools)
@@ -797,11 +884,11 @@ func parseToolCalls(text string, tools []toolDef, jsonFallback bool) (calls []To
 				for _, blob := range blobs {
 					clean = strings.Replace(clean, blob, " ", 1)
 				}
-				return calls, strings.TrimSpace(clean)
+				return calls, scrub(strings.TrimSpace(clean))
 			}
 		}
 	}
-	return nil, text
+	return nil, scrub(text)
 }
 
 // bareJSONBlobs scans the whole text for JSON objects that look like tool

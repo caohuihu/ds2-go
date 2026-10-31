@@ -182,6 +182,7 @@ PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' docker compose u
 
 - 请求体带 OpenAI 风格的 `tools` / `tool_choice`。代理每轮都把工具 schema 和严格的 DSML 调用格式协议注入 system 块，保证 agent 循环（思源笔记、Open WebUI、Cherry Studio、任意 OpenAI SDK）在多轮工具往返中持续可用。
 - 模型回复若含工具调用（DSML `<｜｜DSML｜｜ calls>` 块或 `<|tool_calls|>` 哨兵，容忍全角/半角竖线、大小写、缺失闭合标签），解析后按 OpenAI 规范返回：`message.tool_calls` 填充、`content: null`、`finish_reason: "tool_calls"`。标记碎片会被从 content 中剥离，不外泄。
+- 解析器兼容上游的**降级形态**：网页端偶发把标记开头的 `<` 吃掉（直接下发 `｜｜DSML｜｜ calls>` / `</｜｜DSML｜｜ invoke name="..."`）。tools 模式下 calls 层残片就地剥除、带 `name=` 的闭合形态开标签纠正为开标签、未闭合参数值在下一个标记处截断——残片不污染正文与参数值；无工具（纯聊天）时此类文本保持原文。断流时检测器会回收最后扣留的正文尾巴（≤64 字节，标记碎片剪除），客户端不丢断流前正文。
 - 回传的 `role:"tool"` 结果与 assistant `tool_calls` 会重新渲染进 prompt（哨兵形式 / `[Tool Result id=...]` 行）；会话前缀缓存键纳入规范化的 `tool_calls` 结构，使 agent 每一轮都复用同一上游会话。
 - `tool_choice`：`auto`（默认）、`none`（忽略工具）、`required`、或 `{"type":"function","function":{"name":"..."}}`。
 - 模型输出的未知工具名会被丢弃（严格模式），不透传给 agent。

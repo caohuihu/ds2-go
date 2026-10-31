@@ -794,6 +794,12 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("chat: upstream completion failed: %v", err)
 		if req.Stream {
+			// Stream cut: release the plain text the detector was holding
+			// back (an unclosed "<" or degraded marker fragment tail) so
+			// the client keeps it; a half tool call stays dropped.
+			if tail := detector.recoverTextOnCut(); tail != "" {
+				stream.delta(deepseek.DeltaReply, tail)
+			}
 			stream.errorText(err.Error())
 			return
 		}
