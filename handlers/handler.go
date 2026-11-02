@@ -156,11 +156,17 @@ type Handler struct {
 	prefixToClientIdx map[string]int
 }
 
-// pendingEntry represents an in-flight session creation for one prompt prefix.
-// Waiters block on the done channel until the session is created (or cancelled).
+// pendingEntry represents an in-flight session creation for one prompt
+// prefix. The result (conversation or error) is published under mu and the
+// done channel is closed exactly once, so ANY number of concurrent waiters
+// for the same prefix read the same shared result instead of the first
+// waiter swallowing the only value of a buffered channel and the rest
+// blocking forever.
 type pendingEntry struct {
-	done chan *Conversation
-	ctx  context.Context
+	mu   sync.Mutex
+	conv *Conversation
+	err  error
+	done chan struct{}
 }
 
 func New(cfg *config.Config, pool *AccountPool, convs *ConvStore) *Handler {
@@ -375,6 +381,13 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "bad JSON body: "+err.Error())
 		return
 	}
+	// An empty (or missing) messages array would underflow the
+	// req.Messages[:len(req.Messages)-1] slice below and panic the whole
+	// process — reject it as a 400 instead.
+	if len(req.Messages) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "messages must not be empty")
+		return
+	}
 
 	modelName := req.Model
 	if modelName == "" {
@@ -484,7 +497,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 		OnReady: func(requestID, responseID int64) {
 			conv.ParentID = responseID
 			conv.HasParent = true
-			conv.Turn++
+			conv.turn.Add(1)
 		},
 		OnDelta: routeDeltas,
 		OnUsage: func(accumulated int64) {
@@ -776,7 +789,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	}
 	key := PrefixKey(append(append([]chatMessage{}, req.Messages...), nextMsg), m.ID, keyID)
 	h.convs.Register(key, conv)
-	log.Printf("chat: registered conv session=%s turns=%d keyLen=%d toolCalls=%d", conv.SessionID[:8], conv.Turn, len(key), len(emittedCalls))
+	log.Printf("chat: registered conv session=%s turns=%d keyLen=%d toolCalls=%d", conv.SessionID[:8], conv.Turn(), len(key), len(emittedCalls))
 
 	// Conversation-opening fingerprint (CONV_FINGERPRINT_ROUTE): the next
 	// request of this task will compute the same fingerprint — system +
@@ -823,7 +836,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	usage := h.buildUsage(conv, usageTotal, reply.Len())
 	if req.Stream {
 		stream.finish(usage, req.StreamOptions != nil && req.StreamOptions.IncludeUsage, finishReason)
-		log.Printf("chat %s %s conv=%s turn=%d stream %s", completionID, modelName, conv.SessionID, conv.Turn, time.Since(start).Round(time.Millisecond))
+		log.Printf("chat %s %s conv=%s turn=%d stream %s", completionID, modelName, conv.SessionID, conv.Turn(), time.Since(start).Round(time.Millisecond))
 		return
 	}
 
@@ -852,7 +865,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
-	log.Printf("chat %s %s conv=%s turn=%d %s", completionID, modelName, conv.SessionID, conv.Turn, time.Since(start).Round(time.Millisecond))
+	log.Printf("chat %s %s conv=%s turn=%d %s", completionID, modelName, conv.SessionID, conv.Turn(), time.Since(start).Round(time.Millisecond))
 }
 
 // conversation finds a usable conversation or creates a new DeepSeek session.
@@ -918,7 +931,7 @@ func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool, ke
 	// agent tool-calls to each get their own DeepSeek session.
 	key := PrefixKey(req.Messages[:len(req.Messages)-1], m.ID, keyID)
 	if c := h.convs.ByPrefix(key); c != nil {
-		log.Printf("chat: strategy2 hit session=%s turns=%d", c.SessionID[:8], c.Turn)
+		log.Printf("chat: strategy2 hit session=%s turns=%d", c.SessionID[:8], c.Turn())
 		evict(c)
 		if h.convs.ByPrefix(key) == c {
 			return c, false, howPrefix, nil
@@ -936,7 +949,7 @@ func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool, ke
 	if h.cfg.ConvFingerprintRoute && !firstTurn {
 		fp := convFingerprint(req.Messages, m.ID, keyID)
 		if c := h.convs.ByFingerprint(fp); c != nil {
-			log.Printf("chat: fingerprint hit session=%s turns=%d", c.SessionID[:8], c.Turn)
+			log.Printf("chat: fingerprint hit session=%s turns=%d", c.SessionID[:8], c.Turn())
 			evict(c)
 			if h.convs.ByFingerprint(fp) == c {
 				return c, false, howFingerprint, nil
@@ -950,7 +963,7 @@ func (h *Handler) conversation(req *chatRequest, m *ModelInfo, toolLoop bool, ke
 	// session instead of leaking into some other client's most-recent one.
 	if !h.cfg.ConvFingerprintRoute {
 		if c := h.convs.RecentForModel(m.ID); c != nil {
-			log.Printf("chat: strategy3 hit session=%s turns=%d", c.SessionID[:8], c.Turn)
+			log.Printf("chat: strategy3 hit session=%s turns=%d", c.SessionID[:8], c.Turn())
 			evict(c)
 			if h.convs.BySession(c.SessionID) == c {
 				return c, false, howRecent, nil
@@ -1023,13 +1036,13 @@ func (h *Handler) restoreConvRecords(entries map[string]ConvRecord) (restored, d
 				Client:    h.pool.clients[idx],
 				SessionID: rec.SessionID,
 				ModelID:   rec.Model,
-				Turn:      rec.Turns,
 				turnCount: rec.Turns,
 			}
+			conv.turn.Store(int32(rec.Turns))
 			if rec.LastUsed > 0 {
-				conv.LastUsed = time.Unix(rec.LastUsed, 0)
+				conv.lastUsed.Store(rec.LastUsed)
 			} else {
-				conv.LastUsed = time.Now()
+				conv.lastUsed.Store(time.Now().Unix())
 			}
 			if rec.Expiry > 0 {
 				conv.ttl = time.Until(time.Unix(rec.Expiry, 0))
@@ -1121,17 +1134,17 @@ func (h *Handler) coalesceOrCreate(key, modelID string) (*Conversation, error) {
 	if entry, ok := h.pending[key]; ok {
 		h.pendingMu.Unlock()
 		log.Printf("chat: coalescing onto existing in-flight session prefix=%s", key[:8])
-		select {
-		case conv := <-entry.done:
-			if conv != nil {
-				return conv, nil
-			}
-			return nil, context.Canceled
-		case <-entry.ctx.Done():
-			return nil, entry.ctx.Err()
+		// Wait for the creator to publish; done is closed exactly once.
+		<-entry.done
+		entry.mu.Lock()
+		conv, err := entry.conv, entry.err
+		entry.mu.Unlock()
+		if conv != nil {
+			return conv, nil
 		}
+		return nil, err
 	}
-	entry := &pendingEntry{done: make(chan *Conversation, 1), ctx: context.Background()}
+	entry := &pendingEntry{done: make(chan struct{})}
 	h.pending[key] = entry
 
 	// Determine which account to use for this prefix. A bound account keeps
@@ -1164,31 +1177,37 @@ func (h *Handler) coalesceOrCreate(key, modelID string) (*Conversation, error) {
 		h.pendingMu.Lock()
 		delete(h.pending, key)
 		h.pendingMu.Unlock()
+		var conv *Conversation
 		if err != nil {
 			log.Printf("chat: session create failed: %v", err)
-			entry.done <- nil
-			return
+			err = context.Canceled
+		} else {
+			conv = &Conversation{
+				Client:    client,
+				SessionID: sessionID,
+				ModelID:   modelID,
+			}
+			conv.lastUsed.Store(time.Now().Unix())
 		}
-		entry.done <- &Conversation{
-			Client:    client,
-			SessionID: sessionID,
-			LastUsed:  time.Now(),
-			ModelID:   modelID,
-		}
+		// Publish the result, then wake every coalesced waiter.
+		entry.mu.Lock()
+		entry.conv = conv
+		entry.err = err
+		entry.mu.Unlock()
+		close(entry.done)
 	}()
 	// Drop the lock now — the goroutine runs independently.
 	h.pendingMu.Unlock()
 
 	// Phase 2: wait for the upstream session to be created.
-	select {
-	case conv := <-entry.done:
-		if conv != nil {
-			return conv, nil
-		}
-		return nil, context.Canceled
-	case <-entry.ctx.Done():
-		return nil, entry.ctx.Err()
+	<-entry.done
+	entry.mu.Lock()
+	conv, err := entry.conv, entry.err
+	entry.mu.Unlock()
+	if conv != nil {
+		return conv, nil
 	}
+	return nil, err
 }
 
 func (h *Handler) buildUsage(conv *Conversation, total int64, replyChars int) map[string]int {
@@ -1347,7 +1366,7 @@ func (h *Handler) chatWithRetry(ctx context.Context, conv *Conversation, input d
 		// Rate-limited — retry on the same account with increasing delay.
 		// Switching accounts would break the conversation context, so we
 		// stay put and wait.
-		wait := baseDelay * time.Duration(1<<uint(attempt-1)) // 2s, 4s, 8s...
+		wait := baseDelay * time.Duration(1<<uint(attempt)) // 2s, 4s, 8s...
 		if wait > time.Minute*5 {
 			wait = time.Minute * 5
 		}

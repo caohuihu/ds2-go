@@ -20,6 +20,16 @@
   - **self-heal 拒绝**：坏 token 不再在同一账号上白重建会话；
   - **客户端错误码**：鉴权失败返回 401（此前 502）。
 
+### 正确性修复批次（7 项，零风控行为变化）
+
+- **空 messages 不再打崩进程**（`handlers/handler.go`）：`"messages": []` 或字段缺省会触发会话查找处 `req.Messages[:len(req.Messages)-1]` 切片下溢，在 HTTP 协程里 panic **整个服务进程**（所有进行中任务断掉）。现解码后直接 400，不接触上游。
+- **合并建会话广播给所有等待者**（`handlers/handler.go`）：`pendingEntry` 原是 buffer=1 结果 channel + 永不取消的 `context.Background()`——并发同前缀请求（并行 tool calls 的典型场景）合并进同一建会话流程后，**除第一个等待者外全部永久挂起**。改 mutex + 共享结果 + `close(done)` 广播，所有等待者拿到同一会话（或同一错误）。
+- **日配额跨天后 `Count` 也重置**（`handlers/usage.go`）：跨天归零此前只在 `Use` 里做——所有账号昨日达标时，午夜后首个**新会话**请求走 `Count` 读到昨日残留计数 → 503，且 503 发生在会触发重置的 `Use` 之前，全池 503 直到有人重启。现提取 `rolloverLocked()` 供 Use/Count 共用。
+- **sweep 删除失败不再丢查找键**（`handlers/conversations.go`）：`sweepOnce` 的 `DeleteSession` 失败时此前只把会话插回 `bySession`，`byPrefix`/`byFingerprint` 键丢失——该任务下个请求查不到旧会话 → 白建新上游会话 + 全量重放历史（风控敏感动作），旧会话成孤儿。现记录过期会话的全部键，失败重试路径三表重链，带"不覆盖并发已重绑到别的会话的键"守卫。
+- **429 首次重试真正等待**（`handlers/handler.go`）：退避 `1<<uint(attempt-1)` 在 `attempt=0` 时 uint 下溢为 0——首次 429 立即重试（实际 0s/2s/4s，注释与文档是 2s/4s/8s）。现 `1<<uint(attempt)`。
+- **`Turn`/`LastUsed` 数据竞争修复**（`handlers/conversations.go`）：两字段写侧持会话锁、读侧（日志 / 存储扫描 / 持久化）无锁。改 `atomic.Int32` / `atomic.Int64`（unix 秒）+ `Turn()` / `LastUsed()` getter。
+- **limiter 信号量扩容不再死锁**（`handlers/limiter.go`）：扩大账号在途上限时旧实现在双锁内阻塞 drain 旧 channel；在途槽位的延迟 release 读的是**新** channel，旧 channel 永远回不满 → 有在途请求时该账号全死锁。现直接换新 channel 并按"每个在途请求留一个空槽"预填（在途释放回灌新 channel），不阻塞、在途计数精确。
+
 ### 静默自动续写 + 风控可观测（参考 webai2api）
 
 - **静默自动续写**（`AUTO_CONTINUATION` + `AUTO_CONTINUATION_MAX`，默认 `false` / `2`，`handlers/handler.go` + `config/config.go`）：上游偶尔返回"成功但静默"的空回复（正文、思考全空——长任务静默卡死的典型形态，如 56 轮 stall）。开启后在**同一网页会话**内自动发送 "Continue" 促动（挂接在空回复的 parent 消息上，`ModelType` 置空表示非首轮），最多连续 `AUTO_CONTINUATION_MAX` 次；续写增量流入同一条回复流，客户端看到无缝衔接的答案。仅在回复**完全为空**且会话**已有 parent 消息**时触发，agent 工具流与任何非空回复都不触发；促动失败只记日志并保留已有部分回复，不会让整个请求失败。续写轮**同样计入** `REQUESTS_PER_SESSION` 与日配额（不豁免）。

@@ -7,6 +7,7 @@ import (
 	"log"
 	rand2 "math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/0xgetz/deepseek2api/deepseek"
@@ -22,10 +23,12 @@ type Conversation struct {
 	SessionID string
 	ParentID  int64
 	HasParent bool
-	Turn      int
+	// turn / lastUsed are read outside conv.mu (log lines, store scans)
+	// while the stream callback writes them under it: atomic, not a lock.
+	turn     atomic.Int32
+	lastUsed atomic.Int64 // unix seconds; 0 = not yet set
 	LastUsage int64
 	HasUsage  bool
-	LastUsed  time.Time
 	ttl       time.Duration // per-conversation TTL; 0 = never delete
 	ModelID   string        // the model this session was created for
 	turnCount int           // number of requests served by this session (0 = not yet registered)
@@ -34,8 +37,20 @@ type Conversation struct {
 // Lock guards the conversation for one completion round trip.
 func (c *Conversation) Lock() { c.mu.Lock() }
 func (c *Conversation) Unlock() {
-	c.LastUsed = time.Now()
+	c.lastUsed.Store(time.Now().Unix())
 	c.mu.Unlock()
+}
+
+// Turn returns the number of upstream turns served on this session.
+func (c *Conversation) Turn() int { return int(c.turn.Load()) }
+
+// LastUsed returns the last activity time (zero value when unset).
+func (c *Conversation) LastUsed() time.Time {
+	sec := c.lastUsed.Load()
+	if sec == 0 {
+		return time.Time{}
+	}
+	return time.Unix(sec, 0)
 }
 
 // ConvStore maps derived conversation keys and DeepSeek session ids to
@@ -112,7 +127,7 @@ func (s *ConvStore) RecentForModel(modelID string) *Conversation {
 		if c.ModelID != modelID {
 			continue // skip conversations for other models
 		}
-		if best == nil || c.LastUsed.After(best.LastUsed) {
+		if best == nil || c.lastUsed.Load() > best.lastUsed.Load() {
 			best = c
 		}
 	}
@@ -149,9 +164,11 @@ func (s *ConvStore) Register(prefixKey string, conv *Conversation) {
 	for len(s.bySession) > s.maxSize {
 		var oldestKey string
 		var oldest *Conversation
+		var oldestUsed int64 = -1
 		for key, c := range s.bySession {
-			if oldest == nil || c.LastUsed.Before(oldest.LastUsed) {
-				oldestKey, oldest = key, c
+			used := c.lastUsed.Load()
+			if oldest == nil || (oldestUsed >= 0 && used < oldestUsed) {
+				oldestKey, oldest, oldestUsed = key, c, used
 			}
 		}
 		s.removeLocked(oldestKey, oldest)
@@ -212,12 +229,15 @@ type ConvRecord struct {
 }
 
 func recordOf(c *Conversation) ConvRecord {
-	rec := ConvRecord{SessionID: c.SessionID, Model: c.ModelID, Turns: c.turnCount}
-	if !c.LastUsed.IsZero() {
-		rec.LastUsed = c.LastUsed.Unix()
-		if c.ttl > 0 {
-			rec.Expiry = c.LastUsed.Add(c.ttl).Unix()
-		}
+	lu := c.lastUsed.Load()
+	rec := ConvRecord{
+		SessionID: c.SessionID,
+		Model:     c.ModelID,
+		Turns:     c.turnCount,
+		LastUsed:  lu,
+	}
+	if c.ttl > 0 {
+		rec.Expiry = lu + int64(c.ttl/time.Second)
 	}
 	if c.Client != nil {
 		rec.Account = maskToken(c.Client.Token)
@@ -272,9 +292,11 @@ func (s *ConvStore) LoadSnapshot(bySession map[string]*Conversation, prefixKeys,
 	for len(s.bySession) > s.maxSize {
 		var oldestKey string
 		var oldest *Conversation
+		var oldestUsed int64 = -1
 		for key, c := range s.bySession {
-			if oldest == nil || c.LastUsed.Before(oldest.LastUsed) {
-				oldestKey, oldest = key, c
+			used := c.lastUsed.Load()
+			if oldest == nil || (oldestUsed >= 0 && used < oldestUsed) {
+				oldestKey, oldest, oldestUsed = key, c, used
 			}
 		}
 		s.removeLocked(oldestKey, oldest)
@@ -314,29 +336,64 @@ func (s *ConvStore) SweepLoop(ctx context.Context) {
 
 func (s *ConvStore) sweepOnce(ctx context.Context) {
 	s.mu.Lock()
-	var expired []*Conversation
+	type sweepRec struct {
+		conv   *Conversation
+		prefix []string
+		finger []string
+	}
+	var expired []sweepRec
 	for key, c := range s.bySession {
 		// ttl == 0 means "never delete".
 		if c.ttl == 0 {
 			continue
 		}
-		if time.Since(c.LastUsed) >= c.ttl {
-			expired = append(expired, c)
+		if time.Since(c.LastUsed()) >= c.ttl {
+			rec := sweepRec{conv: c}
+			for k, v := range s.byPrefix {
+				if v == c {
+					rec.prefix = append(rec.prefix, k)
+				}
+			}
+			for k, v := range s.byFingerprint {
+				if v == c {
+					rec.finger = append(rec.finger, k)
+				}
+			}
+			expired = append(expired, rec)
 			s.removeLocked(key, c)
 		}
 	}
 	s.mu.Unlock()
 
-	for _, conv := range expired {
+	for _, rec := range expired {
+		conv := rec.conv
 		dctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		err := conv.Client.DeleteSession(dctx, conv.SessionID)
 		cancel()
 		if err != nil {
 			log.Printf("conversation cleanup: delete session %s failed: %v", conv.SessionID, err)
 			// Queue for a retry on the next sweep; do not hammer upstream.
+			// Re-link EVERY lookup key (not just bySession) so requests
+			// keep routing to this session while the delete is retried —
+			// otherwise the next request would coalesce-create a brand new
+			// upstream session and orphan this one. A key that was already
+			// re-bound to a different session (by a concurrent request) is
+			// never overwritten.
 			s.mu.Lock()
-			conv.LastUsed = time.Now().Add(-conv.ttl)
-			s.bySession[conv.SessionID] = conv
+			if cur := s.bySession[conv.SessionID]; cur == nil || cur == conv {
+				conv.lastUsed.Store(time.Now().Add(-conv.ttl).Unix())
+				s.bySession[conv.SessionID] = conv
+			}
+			for _, k := range rec.prefix {
+				if cur := s.byPrefix[k]; cur == nil || cur == conv {
+					s.byPrefix[k] = conv
+				}
+			}
+			for _, k := range rec.finger {
+				if cur := s.byFingerprint[k]; cur == nil || cur == conv {
+					s.byFingerprint[k] = conv
+				}
+			}
 			s.mu.Unlock()
 		}
 		// The upstream API rate-limits bursts of session operations.

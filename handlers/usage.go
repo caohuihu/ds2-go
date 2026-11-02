@@ -83,11 +83,7 @@ func (u *UsageTracker) load() {
 func (u *UsageTracker) Use(masked string) int {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.day != time.Now().Format("2006-01-02") {
-		// Day rolled over while running: zero the counters and re-assert.
-		u.day = time.Now().Format("2006-01-02")
-		u.counts = make(map[string]int)
-	}
+	u.rolloverLocked()
 	u.counts[masked]++
 	total := u.counts[masked]
 	if time.Since(u.last) >= time.Minute {
@@ -97,10 +93,29 @@ func (u *UsageTracker) Use(masked string) int {
 }
 
 // Count returns the account's current counter (0 when none / quota unset).
+// A day rollover observed here zeroes the counters too — otherwise stale
+// yesterday-totals would keep every account "exhausted" after midnight and
+// new-session requests would 503 until some cached request happened to
+// increment (Use) an account first.
 func (u *UsageTracker) Count(masked string) int {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	u.rolloverLocked()
 	return u.counts[masked]
+}
+
+// rolloverLocked resets the counters when the calendar day has rolled over.
+// Callers hold u.mu.
+func (u *UsageTracker) rolloverLocked() {
+	today := time.Now().Format("2006-01-02")
+	if u.day == today {
+		return
+	}
+	if len(u.counts) > 0 {
+		log.Printf("usage: day rolled over %s → %s, counters reset", u.day, today)
+	}
+	u.day = today
+	u.counts = make(map[string]int)
 }
 
 func (u *UsageTracker) writeLocked() {

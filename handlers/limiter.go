@@ -85,14 +85,19 @@ func (l *AccountLimiter) getBucket(deviceID string, qpm, maxConcurrent int) *acc
 		b.tokens = qpm
 		b.resetAt = time.Now().Add(time.Minute)
 	}
-	// Grow the semaphore capacity if needed.
+	// Grow the semaphore capacity if needed. The new channel is pre-filled
+	// to leave exactly one free slot per IN-FLIGHT request (a slot still
+	// held against the old channel): every holder's deferred release writes
+	// to b.sem — i.e. this NEW channel, re-read at release time — so each
+	// one re-issues a token as it completes. The old channel is discarded
+	// whole: after the swap nothing may ever acquire from it again, and a
+	// blocking drain of it (the previous code) would deadlock here holding
+	// both l.mu and b.mu whenever any slot was in flight, because those
+	// releases never return to the old channel.
 	if cap(b.sem) < maxConcurrent {
-		old := b.sem
+		inFlight := cap(b.sem) - len(b.sem)
 		b.sem = make(chan struct{}, maxConcurrent)
-		for i := 0; i < cap(old); i++ {
-			<-old
-		}
-		for i := 0; i < maxConcurrent; i++ {
+		for i := 0; i < maxConcurrent-inFlight; i++ {
 			b.sem <- struct{}{}
 		}
 	}

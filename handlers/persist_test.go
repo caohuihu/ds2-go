@@ -66,11 +66,11 @@ func TestPersistRoundTrip(t *testing.T) {
 		Client:    h.pool.clients[1],
 		SessionID: "sess-roundtrip",
 		ModelID:   "deepseek-chat",
-		Turn:      2,
 		turnCount: 2,
-		LastUsed:  time.Now(),
 		ttl:       30 * time.Minute,
 	}
+	conv.turn.Store(2)
+	conv.lastUsed.Store(time.Now().Unix())
 	h.convs.Register("pk-roundtrip", conv) // bumps turnCount to 3
 	h.convs.RegisterFingerprint("fp-roundtrip", conv)
 
@@ -191,9 +191,9 @@ func TestPersisterFlush(t *testing.T) {
 		Client:    h.pool.clients[0],
 		SessionID: "sess-flush",
 		ModelID:   "deepseek-chat",
-		LastUsed:  time.Now(),
 		ttl:       time.Hour,
 	}
+	conv.lastUsed.Store(time.Now().Unix())
 	h.convs.Register("pk-flush", conv)
 
 	path := filepath.Join(t.TempDir(), "sub", "conversations.json")
