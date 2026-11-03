@@ -5,25 +5,55 @@ services:
     ports:
       - "8022:8080"
     environment:
+      # ── 代理密钥（多客户端隔离） ────────────────────────────────
+      # 客户端调用本代理用的 key（OpenAI 格式 Authorization: Bearer <key>）。
+      # 留空 = 只用下面密钥文件里的 key；至少配置一个，否则启动报错
       - PROXY_API_KEY=${PROXY_API_KEY:-}
+      # 密钥文件（每行一个 key，容器相对路径，对应 volumes 挂载的 ./proxy-keys.txt；
+      # 文件不存在/为空时自动忽略）。每个 key = 一个独立客户端：会话指纹含 key 身份，
+      # 不同 key 之间会话彻底隔离、互不复用，风控互不牵连
       - PROXY_KEYS_FILE=${PROXY_KEYS_FILE:-proxy-keys.txt}
+      # ── DeepSeek 账号池 ─────────────────────────────────────────
+      # DeepSeek 网页端 userToken（旧式单账号；留空时用下方账号文件）
       - DEEPSEEK_TOKEN=${DEEPSEEK_TOKEN:-}
+      # 账号文件（容器相对路径，每行一个 userToken，对应挂载的 ./accounts.txt）；
+      # 与 DEEPSEEK_TOKEN 合并成账号池，池内至少 1 个账号，否则启动报错
       - DEEPSEEK_ACCOUNTS_FILE=${DEEPSEEK_ACCOUNTS_FILE:-accounts.txt}
+      # ── 服务基础 ───────────────────────────────────────────────
+      # 容器内监听端口（compose 映射 宿主机8022:容器8080；改这里要同步改 ports）
       - PORT=${PORT:-8080}
+      # 上游网页端入口（代理抓包模拟的就是 chat.deepseek.com 网页版 API）
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://chat.deepseek.com}
+      # 对外统一暴露的模型名（OpenAI 客户端发什么模型名都按此处理）
       - DEFAULT_MODEL=${DEFAULT_MODEL:-deepseek-chat}
+      # ── 会话生命周期 ───────────────────────────────────────────
+      # 网页会话空闲 TTL 池（逗号分隔，新建会话时随机取其一；0 = 永不过期）
+      # 默认 10m/60m/2h/5h/永不 各 1/5，打乱会话消亡节奏、避免整点集体清理
       - CONVERSATION_TTL_OPTIONS=${CONVERSATION_TTL_OPTIONS:-10m,60m,2h,5h,0}
+      # 缓存网页会话数量上限（超限先淘汰最近最少用的会话，被淘汰的请求重建会话）
       - MAX_CONVERSATIONS=${MAX_CONVERSATIONS:-1024}
+      # ── 节奏拟人（第一道风控防线） ──────────────────────────────
+      # 每账号每分钟请求上限（拟人建议 1~6；超出自动排队等下一分钟窗口）
       - ACCOUNT_QPM=${ACCOUNT_QPM:-6}
+      # 每账号同时进行中（in-flight）的上游请求数上限，超出在队列等待
       - MAX_CONCURRENT_PER_ACCOUNT=${MAX_CONCURRENT_PER_ACCOUNT:-5}
+      # 上游 429 限流的最大重试次数；每次重试前退避 RETRY_BASE_DELAY×2^n
+      # （默认 2s、4s、8s、16s…指数递增），重试耗尽才把 429 上抛给客户端
       - RETRY_MAX_ATTEMPTS=${RETRY_MAX_ATTEMPTS:-3}
+      # 429 退避基数（可配 duration：500ms/2s/5s…）
       - RETRY_BASE_DELAY=${RETRY_BASE_DELAY:-2s}
+      # 每次发请求前随机等待 200~800ms（模拟真人网络/操作抖动，打齐指纹节奏）
       - REQUEST_JITTER_MIN=${REQUEST_JITTER_MIN:-200ms}
       - REQUEST_JITTER_MAX=${REQUEST_JITTER_MAX:-800ms}
+      # 每次 POW 校验（证明非机器）求解前随机等待 30~150ms
       - POW_JITTER_MIN=${POW_JITTER_MIN:-30ms}
       - POW_JITTER_MAX=${POW_JITTER_MAX:-150ms}
+      # 新建网页会话前随机等待 0~该值（200ms），避免机械式秒建会话
       - SESSION_CREATE_JITTER=${SESSION_CREATE_JITTER:-200ms}
+      # 设备 ID 定期轮换间隔（小时，0=关）：防"一挂数月不换设备"；
+      # 轮换值仅本次运行有效，重启回落到底部固定的设备指纹（详见 DATA_DIR 注释）
       - DEVICE_ID_ROTATE_HOURS=${DEVICE_ID_ROTATE_HOURS:-0}
+      # 账号间冷却间隔（秒）：模拟阅读回复的时间，避免连续发送
       - REQUEST_READ_TIME_MIN=${REQUEST_READ_TIME_MIN:-5s}
       - REQUEST_READ_TIME_MAX=${REQUEST_READ_TIME_MAX:-30s}
       # 会话重置概率：每次有 X% 概率开新会话（影响 Strategy 2 和 Strategy 3）
