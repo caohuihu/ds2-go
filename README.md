@@ -178,7 +178,7 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | `REASONING_FALLBACK` | `true` | Promote thinking text to content when the reply body is empty |
 | `CONV_FINGERPRINT_ROUTE` | `false` | Route by conversation-opening fingerprint: first turn of a new task gets a fresh session on the next round-robin account; in-progress tasks re-attach to their own session/account |
 | `PERSIST_SESSIONS` | `false` | Snapshot the conversation index to a local data dir so in-progress tasks resume (same session + account) after a restart |
-| `DATA_DIR` | `data/` beside the log dir | Directory for the persisted session index (`<DATA_DIR>/conversations.json`); empty = the `data/` folder one level beside the log folder |
+| `DATA_DIR` | `data/` beside the log dir | Directory for persisted state: session index (`conversations.json`, with PERSIST_SESSIONS), daily quota (`daily-usage.json`) and per-account device fingerprints (`device-fingerprints.json`, always on); empty = the `data/` folder one level beside the log folder |
 
 ## Multi-turn conversations
 
@@ -208,6 +208,18 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
   account at its budget is skipped by new-session selection; when *all* are
   spent, new sessions fail fast with 503 until midnight while cached
   sessions keep working.
+- **Stable per-account device fingerprint** (`<DATA_DIR>/device-fingerprints.json`, always on).
+  Before this, *every* process start re-randomized all accounts' user
+  agents, web-client versions, locales and device ids — and the device id
+  was never persisted, so each restart made every account look like a brand
+  new device enrolling again (a device-pool tell). Each account's identity is
+  now picked once from a human-weighted pool (current web-client version
+  preferred, `zh_CN` locale preferred, Windows Chrome/Edge dominant) and
+  pinned in the file: restarts present the same device, and an account
+  removed from and re-added to `accounts.txt` resumes its old identity.
+  The timezone offset is pinned too — set the container `TZ` (e.g.
+  `Asia/Shanghai`) before the first start, since a China-based account
+  reporting UTC+0 is a tell in its own right.
 - **Human-like long pause** (`LONG_PAUSE_CHANCE`, default off). With that
   probability any request (agent tool loops exempt) waits an extra random
   20–60 s before hitting upstream — a "stepped away" long tail on top of the

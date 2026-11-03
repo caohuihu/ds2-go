@@ -35,6 +35,12 @@ func main() {
 	convs := handlers.NewConvStore(cfg.ConversationTTLOptions, cfg.MaxConvs, cfg.RequestsPerSession)
 	rotateInterval := time.Duration(cfg.DeviceIDRotateHours) * time.Hour
 	pool := handlers.NewPool(cfg.Accounts, cfg.PowJitterMin, cfg.PowJitterMax, rotateInterval)
+	// Pin each account to a stable, persisted device identity (device id,
+	// web-client version, locale, user agent, tz offset): a real user's
+	// device does not re-enroll on every proxy restart. Before this, every
+	// start re-randomized all of them — a device-pool tell.
+	fingerprintPath := filepath.Join(cfg.DataDir, "device-fingerprints.json")
+	newFingerprints := pool.ApplyFingerprints(fingerprintPath)
 	h := handlers.New(cfg, pool, convs)
 
 	// Token health: dedicated log file + startup check + background probes.
@@ -129,10 +135,11 @@ func main() {
 		log.Printf("  session create jitter    : %s", cfg.SessionCreateJitter)
 		log.Printf("  device ID rotation       : %s", func() string {
 			if cfg.DeviceIDRotateHours > 0 {
-				return fmt.Sprintf("every %dh", cfg.DeviceIDRotateHours)
+				return fmt.Sprintf("every %dh (rotated ids are NOT re-persisted; a restart falls back to the pinned id)", cfg.DeviceIDRotateHours)
 			}
 			return "disabled"
 		}())
+		log.Printf("  device fingerprints      : stable per account (persisted: %s, %d new this start)", fingerprintPath, newFingerprints)
 		log.Printf("  request read time        : %s ~ %s", cfg.RequestReadTimeMin, cfg.RequestReadTimeMax)
 		log.Printf("  session reset chance     : %.0f%%", cfg.SessionResetChance*100)
 		if cfg.HealthLogFile != "" {

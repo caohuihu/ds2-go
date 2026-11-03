@@ -504,18 +504,28 @@ func newUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// clientVersions are sampled from real DeepSeek web client releases.
-var clientVersions = []string{"2.5.0", "2.4.5", "2.4.0", "2.3.5", "2.3.0"}
+// clientVersions are sampled from real DeepSeek web client releases. The
+// pool weights the CURRENT release: a human web client only moves forward
+// with site upgrades, so older versions are rare. A value is picked ONCE
+// per account at first sight, then pinned (see DeviceFingerprint).
+var clientVersions = []string{"2.5.0", "2.5.0", "2.5.0", "2.4.5", "2.4.5", "2.4.0"}
 
-// clientLocales are sampled from common user locale settings.
-var clientLocales = []string{"zh_CN", "en_US", "zh_TW", "ja_JP", "ko_KR"}
+// clientLocales weights zh_CN heavily: this user base is mainland-Chinese
+// almost always. ja_JP / ko_KR are dropped on purpose — a Japanese/Korean
+// locale on a mainland account reads as a resold or shared account.
+var clientLocales = []string{"zh_CN", "zh_CN", "zh_CN", "zh_CN", "zh_CN", "en_US", "zh_TW"}
 
 // userAgents cover the most common browser/platform combinations observed
-// in real DeepSeek web traffic. Randomising per client reduces fingerprint
-// similarity across accounts.
+// in real DeepSeek web traffic: Windows + Chrome/Edge dominate, a minority
+// of Mac users. Picked once per account and pinned (see DeviceFingerprint):
+// the re-randomization on every restart was itself a device-pool tell.
 var userAgents = []string{
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edg/155.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edg/155.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
 }
 
 func pickRandom[T comparable](slice []T) T {

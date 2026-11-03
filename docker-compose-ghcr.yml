@@ -62,7 +62,11 @@ services:
       # 会话持久化：重启后恢复进行中的任务（同会话同账号，默认关；需挂载 ./data）
       - PERSIST_SESSIONS=${PERSIST_SESSIONS:-false}
       # 数据目录（留空 = 日志目录同层的 data/；容器内默认 /app/data）
+      # 存放 conversations.json（会话索引）与 device-fingerprints.json（设备指纹）
       - DATA_DIR=${DATA_DIR:-}
+      # 时区（容器默认 UTC）：时区偏移是每个账号设备指纹的一部分，首次生成后固定。
+      # 账号在中国时建议首次启动前设置（对已固定的账号不再生效）
+      # - TZ=Asia/Shanghai
     volumes:
       - ./accounts.txt:/app/accounts.txt:ro
       # 多客户端代理密钥（可选，每行一个 key；不挂载则用 PROXY_API_KEY 单 key）

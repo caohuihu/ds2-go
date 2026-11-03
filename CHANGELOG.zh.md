@@ -30,6 +30,13 @@
 - **`Turn`/`LastUsed` 数据竞争修复**（`handlers/conversations.go`）：两字段写侧持会话锁、读侧（日志 / 存储扫描 / 持久化）无锁。改 `atomic.Int32` / `atomic.Int64`（unix 秒）+ `Turn()` / `LastUsed()` getter。
 - **limiter 信号量扩容不再死锁**（`handlers/limiter.go`）：扩大账号在途上限时旧实现在双锁内阻塞 drain 旧 channel；在途槽位的延迟 release 读的是**新** channel，旧 channel 永远回不满 → 有在途请求时该账号全死锁。现直接换新 channel 并按"每个在途请求留一个空槽"预填（在途释放回灌新 channel），不阻塞、在途计数精确。
 
+### 设备指纹稳定化（每账号设备身份固定到 DATA_DIR）
+
+- **修复"重启 = 换设备"**（`deepseek/fingerprint.go` + `handlers/fingerprint.go` + `main.go`）：此前每次代理启动都会重新随机所有账号的「UA / 版本 / 区域」，且设备 ID 每次都是全新 UUID、从不落盘——NAS/CI 每重启一次，每个账号都像"新设备重新入池"（设备池大特征；正常人只有一台固定设备，顶多月后浏览器自动升级）。现在每账号的「设备ID / 版本 / 区域 / UA / 时区偏移」首次启动从拟人池选定一次，固定到 `<DATA_DIR>/device-fingerprints.json`（按 token 前缀作 key，`accounts.txt` 换序不受影响；账号删掉再加回恢复旧指纹——删号 ≠ 换设备），重启沿用同一设备。损坏文件隔离（quarantine）不崩溃，与项目其它状态文件同契约。
+- **随机池拟人化**：版本池向当前版倾斜（2.5.0 占 3/6 槽位——人的 web 客户端版本只向前不回头）；区域池 zh_CN 占 5/7，**去掉 `ja_JP`/`ko_KR`**（大陆账号挂日韩 locale 是卖号特征）；UA 池在 Windows Chrome/Edge 主体上加少量 Mac（Chrome/Safari）权重。
+- **时区同为指纹一部分**：时区偏移一并固定——账号在中国而容器跑 UTC 时，请在**首次启动前**给容器设 `TZ=Asia/Shanghai`（固定值一经生成不随重启改变，compose 文件里已有注释示例）。
+- **`DEVICE_ID_ROTATE_HOURS` 兼容说明**：轮换产生的新设备 ID 仅在本次运行内有效，重启回落固定值（启动 banner 已注明）；该功能默认关闭，绝大多数部署无感知。
+
 ### 静默自动续写 + 风控可观测（参考 webai2api）
 
 - **静默自动续写**（`AUTO_CONTINUATION` + `AUTO_CONTINUATION_MAX`，默认 `false` / `2`，`handlers/handler.go` + `config/config.go`）：上游偶尔返回"成功但静默"的空回复（正文、思考全空——长任务静默卡死的典型形态，如 56 轮 stall）。开启后在**同一网页会话**内自动发送 "Continue" 促动（挂接在空回复的 parent 消息上，`ModelType` 置空表示非首轮），最多连续 `AUTO_CONTINUATION_MAX` 次；续写增量流入同一条回复流，客户端看到无缝衔接的答案。仅在回复**完全为空**且会话**已有 parent 消息**时触发，agent 工具流与任何非空回复都不触发；促动失败只记日志并保留已有部分回复，不会让整个请求失败。续写轮**同样计入** `REQUESTS_PER_SESSION` 与日配额（不豁免）。
