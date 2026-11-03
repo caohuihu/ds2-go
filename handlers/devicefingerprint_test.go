@@ -122,3 +122,23 @@ func TestApplyFingerprintPartialRecord(t *testing.T) {
 		t.Fatalf("unrecorded fields must keep the client default, got %q", c.UserAgent)
 	}
 }
+
+// The tz field of the per-account log line must read like the web client's
+// own display (+08:00 / -05:30), not raw seconds.
+func TestFormatTZ(t *testing.T) {
+	cases := []struct{
+		seconds int
+		want    string
+	}{
+		{28800, "+08:00"},
+		{0, "+00:00"},
+		{-18000, "-05:00"},
+		{19800, "+05:30"},
+		{54750, "+15:12"}, // 15h12m30s → web-style, whole minutes
+	}
+	for _, tc := range cases {
+		if got := formatTZ(tc.seconds); got != tc.want {
+			t.Errorf("formatTZ(%d) = %s, want %s", tc.seconds, got, tc.want)
+		}
+	}
+}

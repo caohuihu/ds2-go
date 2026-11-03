@@ -36,6 +36,7 @@
 - **随机池拟人化**：版本池向当前版倾斜（2.5.0 占 3/6 槽位——人的 web 客户端版本只向前不回头）；区域池 zh_CN 占 5/7，**去掉 `ja_JP`/`ko_KR`**（大陆账号挂日韩 locale 是卖号特征）；UA 池在 Windows Chrome/Edge 主体上加少量 Mac（Chrome/Safari）权重。
 - **时区同为指纹一部分**：时区偏移一并固定——账号在中国而容器跑 UTC 时，请在**首次启动前**给容器设 `TZ=Asia/Shanghai`（固定值一经生成不随重启改变，compose 文件里已有注释示例）。
 - **`DEVICE_ID_ROTATE_HOURS` 兼容说明**：轮换产生的新设备 ID 仅在本次运行内有效，重启回落固定值（启动 banner 已注明）；该功能默认关闭，绝大多数部署无感知。
+- **启动日志可监控**：每次启动，`ApplyFingerprints` 为主日志（`LOG_FILE`）打一行/账号：`fingerprint: #i/n <mask> [new|pinned] ua=… ver=… locale=… tz=+08:00 device=…`——`[new]` 本次新生成并落盘，`[pinned]` 从文件恢复（自首次生成起未变）。grep `fingerprint:` 即可核对每账号正在使用的 UA/版本/区域/时区。
 
 ### 静默自动续写 + 风控可观测（参考 webai2api）
 
