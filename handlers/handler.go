@@ -620,13 +620,13 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Rate-limit per-account to stay under DeepSeek's anti-fraud
-		// thresholds. Blocks until a quota token and a concurrency slot are
-		// both available. Also enforces a minimum cooldown between requests
-		// to the same account (simulates a human reading the reply before
-		// asking the next question).
+		// thresholds. Blocks until a quota token is available. Also enforces
+		// a minimum cooldown between requests to the same account (simulates a
+		// human reading the reply before asking the next question). The
+		// concurrency slot is managed per-attempt inside chatWithRetry.
 		h.enforceReadTimeCooldown(c.Client, toolFlow)
-		release := h.limiter.Wait(c.Client.DeviceID, h.cfg.AccountQPM, h.cfg.MaxConcurrentPerAccount)
-		defer release()
+		releaseToken := h.limiter.WaitQPM(c.Client.DeviceID, h.cfg.AccountQPM, h.cfg.MaxConcurrentPerAccount)
+		defer releaseToken()
 
 		return h.chatWithRetry(r.Context(), c, input, cb)
 	}
@@ -731,7 +731,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 				Prompt:          "Continue",
 			}
 			h.enforceReadTimeCooldown(conv.Client, toolFlow)
-			cRelease := h.limiter.Wait(conv.Client.DeviceID, h.cfg.AccountQPM, h.cfg.MaxConcurrentPerAccount)
+			cRelease := h.limiter.WaitQPM(conv.Client.DeviceID, h.cfg.AccountQPM, h.cfg.MaxConcurrentPerAccount)
 			if cerr := h.chatWithRetry(r.Context(), conv, kin, cb); cerr != nil {
 				log.Printf("chat: auto-continuation %d/%d failed: %v (returning partial reply)", cont, h.cfg.AutoContinuationMax, cerr)
 			}
@@ -1351,8 +1351,17 @@ func (h *Handler) chatWithRetry(ctx context.Context, conv *Conversation, input d
 	if baseDelay <= 0 {
 		baseDelay = 2 * time.Second
 	}
+	deviceID := conv.Client.DeviceID
+	qpm := h.cfg.AccountQPM
+	maxConc := h.cfg.MaxConcurrentPerAccount
 	for attempt := 0; attempt <= h.cfg.RetryMaxAttempts; attempt++ {
+		releaseSlot := h.limiter.WaitSlot(ctx, deviceID, qpm, maxConc)
+		if ctx.Err() != nil {
+			lastErr = ctx.Err()
+			break // no slot acquired (or cancelled while waiting): stop
+		}
 		lastErr = h.doCompletionWithRetry(ctx, conv.Client, input, cb, baseDelay, attempt)
+		releaseSlot()
 		if lastErr == nil {
 			h.pool.MarkRateRecovery(idx)
 			h.stats.RecordCompletion(idx)
@@ -1365,7 +1374,8 @@ func (h *Handler) chatWithRetry(ctx context.Context, conv *Conversation, input d
 		h.pool.MarkRateLimited(idx)
 		// Rate-limited — retry on the same account with increasing delay.
 		// Switching accounts would break the conversation context, so we
-		// stay put and wait.
+		// stay put and wait. The concurrency slot is already released:
+		// the backoff parks no in-flight budget.
 		wait := baseDelay * time.Duration(1<<uint(attempt)) // 2s, 4s, 8s...
 		if wait > time.Minute*5 {
 			wait = time.Minute * 5

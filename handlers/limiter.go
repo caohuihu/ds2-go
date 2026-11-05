@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -36,13 +37,38 @@ func NewAccountLimiter(defaultQPM int) *AccountLimiter {
 // concurrency permit, then returns the release function to call when done.
 // The caller should defer the returned release function.
 func (l *AccountLimiter) Wait(deviceID string, qpm, maxConcurrent int) (release func()) {
-	b := l.getBucket(deviceID, qpm, maxConcurrent)
-	// Acquire a rate-limit token (blocks if exhausted this minute).
-	<-b.acquireToken()
-	// Acquire a concurrency slot (blocks if at in-flight limit).
-	<-b.sem
+	releaseToken := l.WaitQPM(deviceID, qpm, maxConcurrent)
+	releaseSlot := l.WaitSlot(context.Background(), deviceID, qpm, maxConcurrent)
 	return func() {
-		b.sem <- struct{}{}
+		releaseSlot()
+		releaseToken()
+	}
+}
+
+// WaitQPM blocks until a rate-limit token is available for the account,
+// then consumes one. The returned release is a no-op bookend (tokens are
+// consumed per minute window, not returned); defer it for readability.
+//
+// Used in place of Wait when the caller wants to hold ONLY the rate token
+// while the concurrency slot is managed separately (e.g. released during
+// 429 backoff so idle waits never park in-flight slots).
+func (l *AccountLimiter) WaitQPM(deviceID string, qpm, maxConcurrent int) func() {
+	b := l.getBucket(deviceID, qpm, maxConcurrent)
+	<-b.acquireToken()
+	return func() {}
+}
+
+// WaitSlot blocks until a free concurrency permit is available, then
+// returns the release function for it. If ctx is cancelled while waiting,
+// no slot is acquired and the returned release is a no-op — the caller
+// must check ctx.Err() itself and stop.
+func (l *AccountLimiter) WaitSlot(ctx context.Context, deviceID string, qpm, maxConcurrent int) func() {
+	b := l.getBucket(deviceID, qpm, maxConcurrent)
+	select {
+	case <-b.sem:
+		return func() { b.sem <- struct{}{} }
+	case <-ctx.Done():
+		return func() {}
 	}
 }
 
