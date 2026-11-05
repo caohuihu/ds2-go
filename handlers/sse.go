@@ -17,6 +17,7 @@ type sseWriter struct {
 	conversation string
 	opened       bool
 	failed       bool
+	toolSeq      int // tool calls emitted so far; new batches continue from here
 }
 
 func newSSEWriter(w http.ResponseWriter, id, model string, created int64, conversation string) *sseWriter {
@@ -57,15 +58,21 @@ func (s *sseWriter) delta(kind deepseek.DeltaKind, text string) {
 }
 
 // toolCalls emits OpenAI-spec tool_call delta chunks: per call, one chunk
-// with id + name and one with the arguments.
+// with id + name and one with the arguments. Indices continue across the
+// writer's whole stream (the OpenAI spec numbers tool_calls globally per
+// message, not per delivery batch): the marker detector flushes one
+// action per block, so a second block must start where the first ended —
+// restarting at 0 makes clients stack every call into slot 0.
 func (s *sseWriter) toolCalls(calls []ToolCall) {
 	if s.failed || !s.opened || len(calls) == 0 {
 		return
 	}
+	base := s.toolSeq
 	for i, c := range calls {
+		idx := base + i
 		head := map[string]any{
 			"tool_calls": []any{map[string]any{
-				"index": i,
+				"index": idx,
 				"id":    c.ID,
 				"type":  "function",
 				"function": map[string]any{
@@ -80,7 +87,7 @@ func (s *sseWriter) toolCalls(calls []ToolCall) {
 		}
 		args := map[string]any{
 			"tool_calls": []any{map[string]any{
-				"index": i,
+				"index": idx,
 				"function": map[string]any{
 					"arguments": c.Arguments,
 				},
@@ -91,6 +98,7 @@ func (s *sseWriter) toolCalls(calls []ToolCall) {
 			return
 		}
 	}
+	s.toolSeq = base + len(calls)
 }
 
 func (s *sseWriter) finish(usage map[string]int, includeUsage bool, finishReason string) {
