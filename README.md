@@ -163,6 +163,7 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | `REQUEST_READ_TIME_MAX` | `30s` | 同一账号两次请求之间的最大等待（秒） |
 | `SESSION_RESET_CHANCE` | `0.15` | 每次请求有 X% 概率开新会话（同时影响 Strategy 2 和 Strategy 3，控制连续问答的"断句"频率） |
 | `REQUESTS_PER_SESSION` | `0` | 每个会话最大请求数，到达后强制创建新会话（0=关闭，与 SESSION_RESET_CHANCE 配合使用） |
+| `SESSION_REPLAY_TURNS` | `2` | 开新会话（换会话）时的"播种"轮数：agent 工具流下，当前指令前重放多少个完整轮组（user 指令+其 assistant/tool 交换）。`2`=默认（最近 2 轮）；`0`=只发当前指令（痕迹最薄）；`all`=全量历史（旧版行为）。普通聊天不受影响 |
 | `LOG_FILE` | `/app/logs/app.log` | 日志文件路径，留空只输出到 stdout；设置后日志同时写入文件 |
 | `STARTUP_ACCOUNT_CHECK` | `true` | 启动时对全部账号做一次轻量鉴权探测，失效账号自动隔离 |
 | `HEALTH_PROBE_INTERVAL` | `30m` | 周期探测所有存活账号的间隔（0=关闭） |
@@ -234,12 +235,28 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
   stream, so the client sees one seamless answer. Continuation turns count
   toward `REQUESTS_PER_SESSION` and the daily quota; tool-flow turns and
   replies with any content never trigger it.
+- **Fresh-session seeding** (`SESSION_REPLAY_TURNS`, default `2`, agent
+  tool flows only). The DeepSeek web page holds no state, so when a new
+  upstream session is opened the proxy must "paste" relevant history into
+  the prompt. N = how many complete turn groups (a user instruction plus
+  the assistant/tool exchange it produced) are replayed ahead of the
+  current instruction: `2` = default (keeps the last two turns, so long
+  tasks survive a session swap without the paste volume looking machine-
+  generated); `0` = the current instruction only (thinnest trace, fine for
+  short Q&A); `all` = full history (the pre-1.10.3 behavior: richest
+  context, most conspicuous trace). Applies on session resets
+  (`SESSION_RESET_CHANCE` / `REQUESTS_PER_SESSION`) and when a dead cached
+  session is recreated; the plain chat path is untouched.
 - **Risk observability** (`RISK_STATS_INTERVAL`, default off). At that
   interval the main log gets a risk summary: global request / session-created
-  / cache-hit counters, plus per-account successful completions,
+  / cache-hit counters, a per-request outcome breakdown
+  (429 / auth / ban / upstream / empty-reply / client-cancelled) and the mean
+  request latency, plus per-account successful completions,
   consecutive-429 count, cooldown & BAN-hold remaining, daily-quota usage
   and in-flight count. The created-vs-hits ratio is the primary risk signal —
-  new sessions are the expensive, fingerprintable upstream action.
+  new sessions are the expensive, fingerprintable upstream action. 429/503
+  responses also carry a `Retry-After` hint derived from the pool's longest
+  active 429 cooldown.
 - **Multi-client isolation** (`PROXY_KEYS_FILE`, active with ≥2 keys). Give each
   client a distinct proxy key (e.g. SiYuan uses key 1, opencode uses key 2). The
   key's stable id is mixed into the **prefix and fingerprint keys**, so distinct

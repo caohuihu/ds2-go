@@ -63,6 +63,11 @@ services:
       # 每个 DeepSeek 会话最多处理 N 条消息，之后自动创建新会话
       # 0 = 关闭（仅依赖 SESSION_RESET_CHANCE 随机控制）
       # 推荐值：5~10 → 约每 5-10 条消息开一个新会话，可实现 3-5 个会话持续运行
+      - REQUESTS_PER_SESSION=${REQUESTS_PER_SESSION:-0}
+      # 开新会话时的播种（仅 agent 工具流；普通聊天不受影响）：
+      # 当前指令前粘贴多少个完整轮组。2 = 默认（最近 2 轮，换会话后前情基本不丢）；
+      # 0 = 只发当前指令（痕迹最薄）；all = 全量历史（旧版行为）
+      - SESSION_REPLAY_TURNS=${SESSION_REPLAY_TURNS:-2}
       # 日志文件路径（容器内），挂载到宿主机可查看历史日志
       - LOG_FILE=${LOG_FILE:-}
       # 检测日志文件（可选，留空默认与 LOG_FILE 同目录：/app/logs/deepseek-health.log）

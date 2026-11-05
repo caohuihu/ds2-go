@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### 新会话播种 / 429 槽位 / 可观测细粒度 / 流式工具索引（参考 webai2api 批次）
+
+- **⚠️ 新会话播种不再全量重放（默认行为变更）**（`SESSION_REPLAY_TURNS`，`handlers/handler.go` + `handlers/conversations.go` + `config/config.go`）：此前 agent 工具流开新会话（会话重置 / 配额轮换 / 死会话重建）时，会把客户端**全部**历史消息重放进提示词——这是本代理最明显的机器特征之一。现在只播种**最近 N 个完整轮组**（user 指令 + 其产生的 assistant/tool 交换），且只在 user 消息边界切，绝不断开工具链。新 env `SESSION_REPLAY_TURNS`：`2` = 默认（保留最近 2 轮，换会话后前情基本不丢）；`0` = 只发当前指令（痕迹最薄，适合短问答）；`all` = 全量重放（旧版行为，需回退时用它）。每个新会话播种会打日志 `chat: fresh session seeded with X of Y messages (SESSION_REPLAY_TURNS=N)`，启动 banner 一行显示当前策略。**普通聊天路径不受影响**（本来就只发最后一条 user 消息）。升级后若感觉长任务换会话"忘前情"，把值调大即可；`all` 可完整恢复旧行为。
+- **429 退避不再占并发槽**（`handlers/limiter.go` + `handlers/handler.go`）：限流器拆为 `WaitQPM`（速率令牌）与 `WaitSlot`（在途许可，支持 ctx 取消——取消时不占槽、释放为 no-op）。`chatWithRetry` 每个 attempt 自取自释槽，429 指数退避的 sleep 期间**不占任何在途预算**：限流风暴不再把一个账号的整个并发池冻在空等里。QPM 令牌语义零变化（一次逻辑请求一个令牌，重试不重复扣）；退避时长与账号级 429 升级不变。
+- **风控摘要新增结果分类 + 平均响应时长**（`handlers/stats.go` + `handlers/handler.go`）：每个请求归入唯一结果类——`429` / `auth`（坏 token）/ `ban`（封禁措辞）/ `upstream`（无活账号 / 日配额 / 通用 5xx）/ `empty`（静默空回复触发了自动续写）/ `cancelled`（客户端中途离开），`RISK_STATS_INTERVAL` 摘要多打一行 `risk: outcomes …` + `first_content`（成功请求平均耗时）；429/503 响应附带 `Retry-After` 头（取全池最长 429 冷却），让客户端能自动退避。
+- **流式 tool_calls 索引跨批续号**（`handlers/sse.go`）：OpenAI 规范要求 tool_call delta 的 index 按整条消息全局编号，但 SSE 写器此前每个标记批都从 0 重编——一次回复含 2+ 个工具调用时，第二批的 index 与第一批撞车，客户端把所有调用堆进 0 号槽。写器现在跨整个流维护 `toolSeq`，后续批次从上一批末尾继续（回归测试锁定：2+1 调用批 → 0,1 然后 2）。
+
 ### 工具调用标记鲁棒性（参考 webai2api v0.1.51 审计批次）
 
 - **降级形态标记**（`handlers/tools.go` + `handlers/tools_stream.go`）：上游网页端偶发把标记开头的 `<` 吃掉，直接下发 `｜｜DSML｜｜ calls>`、`</｜｜DSML｜｜ invoke name="...">` 这类残片；此前所有 DSML 正则均以 `<` 开头锚定，残片会漏进正文。tools 模式下现在：识别无 `<` 的开标签；calls 层残片就地剥除（invoke 层半截块保守不剥，维持既有契约）；闭合形态误写但带 `name=` 的开标签（`</...invoke name="x">`）纠正为开标签；断流时回收 SCAN 态扣住的普通正文（`recoverTextOnCut`，尾部标记碎片气味剪除，≤64 字，不碰 markdown 表格），客户端不再丢断流前最后一段正文。
