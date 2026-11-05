@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -50,6 +51,7 @@ type Config struct {
 	ConvFingerprintRoute    bool          // route conversations by their opening fingerprint; first turns start a fresh session on the next round-robin account (default false)
 	PersistSessions         bool          // persist the conversation index to a local data file so tasks survive a restart (default false)
 	DataDir                 string        // data folder for persisted state; default <LOG_FILE dir>/../data, else ./data
+	SessionReplayTurns      int           // fresh-session seeding for tool flows: number of complete turn groups to replay ahead of the current instruction (default 2; 0 = instruction only; -1 = all, the legacy full replay)
 }
 
 // Load reads configuration from the environment. Accounts come from
@@ -98,6 +100,7 @@ func Load() (*Config, error) {
 		ReasoningFallback:       parseBoolEnv("REASONING_FALLBACK", true),
 		ConvFingerprintRoute:    parseBoolEnv("CONV_FINGERPRINT_ROUTE", false),
 		PersistSessions:         parseBoolEnv("PERSIST_SESSIONS", false),
+		SessionReplayTurns:      parseReplayTurnsEnv("SESSION_REPLAY_TURNS", 2),
 	}
 	// Proxy API keys: PROXY_API_KEY (optional) plus one-per-line entries in
 	// PROXY_KEYS_FILE. When PROXY_API_KEY is empty the file is the source of
@@ -307,4 +310,26 @@ func parseBoolEnv(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+// parseReplayTurnsEnv reads SESSION_REPLAY_TURNS: how many complete turn
+// groups (user instruction + the assistant/tool exchange it produced) a
+// fresh upstream session is seeded with ahead of the current instruction.
+// "all" (any case) = -1, the legacy full-history replay; a non-negative
+// integer N is taken as-is (0 = the current instruction only); unset or
+// unparseable falls back to def (2) with a warning.
+func parseReplayTurnsEnv(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if strings.EqualFold(v, "all") {
+		return -1
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		log.Printf("config: invalid %s=%q (want a non-negative integer or \"all\"); using %d", key, v, def)
+		return def
+	}
+	return n
 }

@@ -544,6 +544,17 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 				if la := lastAssistantIndex(req.Messages); la >= 0 {
 					start = la + 1
 				}
+			} else if h.cfg.SessionReplayTurns >= 0 {
+				// Fresh session: the upstream holds no memory of this
+				// conversation, so seed it. Default policy
+				// (SESSION_REPLAY_TURNS=2) replays only the two most recent
+				// complete turn groups ahead of the current instruction —
+				// enough to keep a long task coherent without looking like a
+				// machine dumping its whole transcript into a new chat.
+				// 0 = current instruction only; -1 ("all") keeps the legacy
+				// full replay, which is the `start := 0` default above.
+				start = replayStartIndex(req.Messages, h.cfg.SessionReplayTurns)
+				log.Printf("chat: fresh session seeded with %d of %d messages (SESSION_REPLAY_TURNS=%d)", len(req.Messages)-start, len(req.Messages), h.cfg.SessionReplayTurns)
 			}
 			if activeTools {
 				if tp := buildToolPrompt(tools, choice); tp != "" {

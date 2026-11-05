@@ -25,8 +25,8 @@ type Conversation struct {
 	HasParent bool
 	// turn / lastUsed are read outside conv.mu (log lines, store scans)
 	// while the stream callback writes them under it: atomic, not a lock.
-	turn     atomic.Int32
-	lastUsed atomic.Int64 // unix seconds; 0 = not yet set
+	turn      atomic.Int32
+	lastUsed  atomic.Int64 // unix seconds; 0 = not yet set
 	LastUsage int64
 	HasUsage  bool
 	ttl       time.Duration // per-conversation TTL; 0 = never delete
@@ -222,7 +222,7 @@ type ConvRecord struct {
 	Model           string   `json:"model,omitempty"`
 	Account         string   `json:"account,omitempty"` // maskToken of the owning account
 	Turns           int      `json:"turns,omitempty"`
-	LastUsed        int64    `json:"last_used"` // unix seconds
+	LastUsed        int64    `json:"last_used"`        // unix seconds
 	Expiry          int64    `json:"expiry,omitempty"` // unix seconds; 0 = never
 	PrefixKeys      []string `json:"prefix_keys,omitempty"`
 	FingerprintKeys []string `json:"fingerprint_keys,omitempty"`
@@ -426,6 +426,30 @@ func PrefixKey(messages []chatMessage, model, keyID string) string {
 	h.Write([]byte{0x00})
 	h.Write([]byte(keyID))
 	return hex.EncodeToString(h.Sum(nil)[:16])
+}
+
+// replayStartIndex returns the index into messages from which a fresh
+// upstream session should be seeded, given SessionReplayTurns = n. It counts
+// user-message boundaries backward from the end: n = -1 → 0 (the legacy
+// full-history replay), n = 0 → the last user message only (the current
+// instruction), n = k → k complete user/assistant/tool turn groups ahead of
+// the final user message. Counting only user messages means the slice never
+// cuts through a tool-call chain: tool results and their assistant calls
+// live between two user messages and are kept whole.
+func replayStartIndex(messages []chatMessage, n int) int {
+	if n < 0 {
+		return 0
+	}
+	seen := 0
+	for i := len(messages) - 1; i >= 0 && seen <= n; i-- {
+		if messages[i].Role == "user" {
+			if seen == n {
+				return i
+			}
+			seen++
+		}
+	}
+	return 0
 }
 
 // convFingerprint identifies a client-side conversation by its opening:

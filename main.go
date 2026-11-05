@@ -142,6 +142,14 @@ func main() {
 		log.Printf("  device fingerprints      : stable per account (persisted: %s, %d new this start)", fingerprintPath, newFingerprints)
 		log.Printf("  request read time        : %s ~ %s", cfg.RequestReadTimeMin, cfg.RequestReadTimeMax)
 		log.Printf("  session reset chance     : %.0f%%", cfg.SessionResetChance*100)
+		switch {
+		case cfg.SessionReplayTurns < 0:
+			log.Printf("  session replay turns     : all (fresh sessions re-seed the full history)")
+		case cfg.SessionReplayTurns == 0:
+			log.Printf("  session replay turns     : 0 (fresh sessions get the current instruction only)")
+		default:
+			log.Printf("  session replay turns     : %d (fresh sessions seeded with the last %d turn groups)", cfg.SessionReplayTurns, cfg.SessionReplayTurns)
+		}
 		if cfg.HealthLogFile != "" {
 			log.Printf("  health log file        : %s", cfg.HealthLogFile)
 		}

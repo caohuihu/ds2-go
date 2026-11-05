@@ -82,3 +82,35 @@ func TestHealthLogFileResolvesNextToMainLog(t *testing.T) {
 		t.Fatalf("health log = %q, want deepseek-health.log", cfg.HealthLogFile)
 	}
 }
+
+func TestSessionReplayTurnsParsing(t *testing.T) {
+	cases := []struct {
+		name string
+		val  string
+		want int
+	}{
+		{"unset falls back to default", "", 2},
+		{"all (lower) is the legacy full replay", "all", -1},
+		{"ALL (upper) is case-insensitive", "ALL", -1},
+		{"zero means current instruction only", "0", 0},
+		{"plain integer is kept", "5", 5},
+		{"surrounding whitespace is trimmed", "  3 ", 3},
+		{"negative integer is invalid", "-1", 2},
+		{"non-numeric is invalid", "banana", 2},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("PROXY_API_KEY", "test")
+			t.Setenv("DEEPSEEK_TOKEN", "tok-123")
+			t.Setenv("DEEPSEEK_ACCOUNTS_FILE", filepath.Join(t.TempDir(), "none.txt"))
+			t.Setenv("SESSION_REPLAY_TURNS", c.val)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if cfg.SessionReplayTurns != c.want {
+				t.Fatalf("SESSION_REPLAY_TURNS=%q → %d, want %d", c.val, cfg.SessionReplayTurns, c.want)
+			}
+		})
+	}
+}
