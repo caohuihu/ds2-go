@@ -218,6 +218,22 @@ func (p *AccountPool) CoolingLeft(idx int) time.Duration {
 	return left
 }
 
+// MaxCoolingLeft returns the longest remaining 429 cooldown among all
+// accounts (0 = nobody cooling). The 429/503 responses that out of pool
+// capacity use it for a Retry-After hint.
+func (p *AccountPool) MaxCoolingLeft() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	var max time.Duration
+	for i := range p.clients {
+		if left := p.cooldownUntil[i].Sub(now); left > max {
+			max = left
+		}
+	}
+	return max
+}
+
 // SetBanUntil holds a BAN-detected account out of rotation until then (a
 // probe after the hold may still revive it). Until.IsZero() = no hold.
 func (p *AccountPool) SetBanUntil(idx int, until time.Time) {

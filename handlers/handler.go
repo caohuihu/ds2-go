@@ -11,6 +11,7 @@ import (
 	"log"
 	rand2 "math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -318,6 +319,26 @@ func writeError(w http.ResponseWriter, status int, errType, msg string) {
 	json.NewEncoder(w).Encode(e)
 }
 
+// writeUpstreamError records the outcome class of an upstream failure and
+// writes the OpenAI-style error response. 429/503 responses additionally
+// carry a Retry-After hint derived from the pool's longest active 429
+// cooldown, so well-behaved clients can back off instead of hammering the
+// proxy.
+func (h *Handler) writeUpstreamError(w http.ResponseWriter, err error) {
+	h.recordUpstreamError(err)
+	status, msg := mapUpstreamError(err)
+	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
+		if left := h.pool.MaxCoolingLeft(); left > 0 {
+			secs := int(left.Round(time.Second).Seconds())
+			if secs < 1 {
+				secs = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+		}
+	}
+	writeError(w, status, "api_error", msg)
+}
+
 // clientKeyIDKey is the context key carrying the authenticated client's key id.
 type clientKeyIDKey struct{}
 
@@ -425,8 +446,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	conv, fresh, how, err := h.conversation(&req, m, toolFlow, keyID)
 	if err != nil {
 		log.Printf("chat: create session failed: %v", err)
-		status, msg := mapUpstreamError(err)
-		writeError(w, status, "api_error", msg)
+		h.writeUpstreamError(w, err)
 		return
 	}
 
@@ -437,8 +457,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	conv, fresh, how, err = h.migrateOffDeadAccount(&req, m, toolFlow, conv, fresh, how, keyID)
 	if err != nil {
 		log.Printf("chat: create session failed: %v", err)
-		status, msg := mapUpstreamError(err)
-		writeError(w, status, "api_error", msg)
+		h.writeUpstreamError(w, err)
 		return
 	}
 
@@ -635,6 +654,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 		stream = newSSEWriter(w, completionID, modelName, createdAt, conv.SessionID)
 		if err := stream.open(); err != nil {
 			log.Printf("chat: client went away before stream start: %v", err)
+			h.stats.RecordCancelled()
 			return
 		}
 	}
@@ -720,7 +740,9 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	// reply builders, so the client sees one seamless answer. Continuation
 	// turns count toward REQUESTS_PER_SESSION and the daily quota. A failed
 	// nudge logs and keeps the partial reply instead of failing the request.
-	if h.cfg.AutoContinuation && h.cfg.AutoContinuationMax > 0 && err == nil {
+	if h.cfg.AutoContinuation && h.cfg.AutoContinuationMax > 0 && err == nil &&
+		shouldAutoContinue(conv, toolFlow, reply.String(), thinking.String(), emittedCalls) {
+		h.stats.RecordEmpty() // this completion came back silent; the nudges below recover it
 		for cont := 1; cont <= h.cfg.AutoContinuationMax && shouldAutoContinue(conv, toolFlow, reply.String(), thinking.String(), emittedCalls); cont++ {
 			log.Printf("chat: silent upstream reply — auto-continuation %d/%d on session %s", cont, h.cfg.AutoContinuationMax, conv.SessionID)
 			parent := conv.ParentID
@@ -810,6 +832,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		if r.Context().Err() != nil {
+			h.stats.RecordCancelled()
 			return // client gone; upstream message completes on its own
 		}
 		log.Printf("chat: upstream completion failed: %v", err)
@@ -817,14 +840,14 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 			// Stream cut: release the plain text the detector was holding
 			// back (an unclosed "<" or degraded marker fragment tail) so
 			// the client keeps it; a half tool call stays dropped.
+			h.recordUpstreamError(err)
 			if tail := detector.recoverTextOnCut(); tail != "" {
 				stream.delta(deepseek.DeltaReply, tail)
 			}
 			stream.errorText(err.Error())
 			return
 		}
-		status, msg := mapUpstreamError(err)
-		writeError(w, status, "api_error", msg)
+		h.writeUpstreamError(w, err)
 		return
 	}
 
@@ -836,6 +859,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	usage := h.buildUsage(conv, usageTotal, reply.Len())
 	if req.Stream {
 		stream.finish(usage, req.StreamOptions != nil && req.StreamOptions.IncludeUsage, finishReason)
+		h.stats.RecordFirstContent(time.Since(start))
 		log.Printf("chat %s %s conv=%s turn=%d stream %s", completionID, modelName, conv.SessionID, conv.Turn(), time.Since(start).Round(time.Millisecond))
 		return
 	}
@@ -865,6 +889,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+	h.stats.RecordFirstContent(time.Since(start))
 	log.Printf("chat %s %s conv=%s turn=%d %s", completionID, modelName, conv.SessionID, conv.Turn(), time.Since(start).Round(time.Millisecond))
 }
 
@@ -1325,10 +1350,41 @@ func mapUpstreamError(err error) (int, string) {
 	return http.StatusBadGateway, "deepseek upstream error: " + err.Error()
 }
 
+// recordUpstreamError buckets an upstream failure into one outcome class so
+// the periodic risk summary can say WHICH failure mode is showing up (rate
+// pressure vs dead tokens vs bans vs generic upstream) instead of one lumped
+// error count. Precedence mirrors mapUpstreamError's own: ban wording wins
+// (the account is being held, not just failing), then auth, then 429, and
+// everything else (no live account, daily limit, generic upstream error)
+// counts as "upstream".
+func (h *Handler) recordUpstreamError(err error) {
+	if err == nil || h.stats == nil {
+		return
+	}
+	switch {
+	case banKeyword(err) != "":
+		h.stats.RecordBan()
+	case deepseek.IsAuthFailure(err):
+		h.stats.RecordAuth()
+	default:
+		var ae *deepseek.APIError
+		if errors.As(err, &ae) && ae.HTTPStatus == 429 {
+			h.stats.Record429()
+			return
+		}
+		h.stats.RecordUpstream()
+	}
+}
+
 // chatWithRetry calls conv.Client.Completion with exponential-backoff retry
 // on 429 responses. It stays on the same account for the entire conversation
 // to preserve context; only the read-time cooldown and QPM token bucket provide
 // back-pressure.
+//
+// Concurrency slots are held ONLY while the upstream completion runs: each
+// attempt acquires and releases its own slot, so the backoff sleeps between
+// 429 retries park no slots — a storm of rate-limited requests cannot freeze
+// the account's whole in-flight budget behind idle waits.
 func (h *Handler) chatWithRetry(ctx context.Context, conv *Conversation, input deepseek.CompletionInput, cb *deepseek.StreamCallbacks) error {
 	// Daily quota: count this request against the serving account so the
 	// rotation skips it once the budget is spent (counted once per request,

@@ -1,9 +1,12 @@
 package handlers
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/0xgetz/deepseek2api/config"
+	"github.com/0xgetz/deepseek2api/deepseek"
 )
 
 // newStatsHandler builds a handler with poolSize accounts and no
@@ -99,4 +102,97 @@ func TestLogRiskStats(t *testing.T) {
 	h.stats.RecordRequest()
 	h.stats.RecordCompletion(0)
 	h.LogRiskStats() // must not panic; output goes to the test log
+}
+
+// TestRiskStatsOutcomeCounters: the six outcome classes count independently,
+// FirstContentAvg averages the recorded latencies, and nil receivers are
+// safe (test handlers built without stats must not crash the paths that
+// record outcomes).
+func TestRiskStatsOutcomeCounters(t *testing.T) {
+	var nilS *RiskStats
+	nilS.Record429()
+	nilS.RecordCancelled()
+	nilS.RecordFirstContent(time.Second) // no panic
+
+	s := NewRiskStats(2)
+	s.Record429()
+	s.RecordAuth()
+	s.RecordBan()
+	s.RecordUpstream()
+	s.RecordEmpty()
+	s.RecordCancelled()
+	s.Record429()
+	want := map[string]int64{"429": 2, "auth": 1, "ban": 1, "upstream": 1, "empty": 1, "cancelled": 1}
+	ec := s.ErrorCounts()
+	if len(ec) != len(want) {
+		t.Fatalf("ErrorCounts = %v, want %d entries", ec, len(want))
+	}
+	for _, p := range ec {
+		if p.n != want[p.label] {
+			t.Fatalf("outcome %q = %d, want %d", p.label, p.n, want[p.label])
+		}
+	}
+
+	s.RecordFirstContent(200 * time.Millisecond)
+	s.RecordFirstContent(400 * time.Millisecond)
+	if got := s.FirstContentAvg(); got != 300*time.Millisecond {
+		t.Fatalf("FirstContentAvg = %s, want 300ms", got)
+	}
+	// No recordings yet on a fresh counter set → 0, not NaN/panic.
+	if got := NewRiskStats(1).FirstContentAvg(); got != 0 {
+		t.Fatalf("FirstContentAvg (empty) = %s, want 0", got)
+	}
+}
+
+// TestRecordUpstreamErrorClasses: classification mirrors
+// mapUpstreamError's precedence — ban wording beats auth, 429 is its own
+// class, and everything else (dead pool, daily limit, generic upstream)
+// counts as "upstream".
+func TestRecordUpstreamErrorClasses(t *testing.T) {
+	h := newStatsHandler(t, 2)
+	h.recordUpstreamError(&deepseek.APIError{HTTPStatus: 429})
+	h.recordUpstreamError(&deepseek.APIError{HTTPStatus: 401})
+	h.recordUpstreamError(errors.New("deepseek upstream error: 账号已被封禁"))
+	h.recordUpstreamError(errNoLiveAccount)
+	h.recordUpstreamError(errors.New("boom"))
+	h.recordUpstreamError(nil)                                                             // safe
+	(&Handler{pool: NewPool([]string{"t"}, 0, 0, 0)}).recordUpstreamError(errors.New("x")) // nil stats is safe
+
+	want := map[string]int64{"429": 1, "auth": 1, "ban": 1, "upstream": 2, "empty": 0, "cancelled": 0}
+	for _, p := range h.stats.ErrorCounts() {
+		if p.n != want[p.label] {
+			t.Fatalf("outcome %q = %d, want %d", p.label, p.n, want[p.label])
+		}
+	}
+}
+
+// TestWriteUpstreamErrorRetryAfter: 429/503 responses carry a Retry-After
+// hint from the pool's longest active 429 cooldown; no hint when nobody is
+// cooling.
+func TestWriteUpstreamErrorRetryAfter(t *testing.T) {
+	h := newStatsHandler(t, 2)
+	h.pool.cooldownUntil[0] = time.Now().Add(58 * time.Second)
+
+	fr := &flushRecorder{}
+	h.writeUpstreamError(fr, &deepseek.APIError{HTTPStatus: 429})
+	if got := fr.header.Get("Retry-After"); got != "58" {
+		t.Fatalf("429 Retry-After = %q, want 58", got)
+	}
+	if got := fr.header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+
+	fr2 := &flushRecorder{}
+	h.writeUpstreamError(fr2, errNoLiveAccount) // 503
+	if got := fr2.header.Get("Retry-After"); got != "58" {
+		t.Fatalf("503 Retry-After = %q, want 58", got)
+	}
+
+	// No cooldown active → no hint.
+	h.pool.cooldownUntil[0] = time.Time{}
+	fr3 := &flushRecorder{}
+	h.writeUpstreamError(fr3, &deepseek.APIError{HTTPStatus: 429})
+	if got := fr3.header.Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After without cooldown = %q, want empty", got)
+	}
 }
