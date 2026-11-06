@@ -142,9 +142,11 @@ type Handler struct {
 	// them (RISK_STATS_INTERVAL ticker in main).
 	stats *RiskStats
 	mu    sync.Mutex // protects lastRequestAt
-	// lastRequestAt tracks the time of the last request per client pointer,
-	// enforcing a cooldown to simulate a human reading the reply.
-	lastRequestAt map[*deepseek.Client]time.Time
+	// lastRequestAt tracks, per client pointer, when the last request
+	// completed and how long its upstream reply was — the next request
+	// paces itself off both, simulating a human reading the reply before
+	// asking the next question.
+	lastRequestAt map[*deepseek.Client]requestStamp
 
 	// pendingMu protects pending and prefixToClientIdx so concurrent requests
 	// for the same conversation prefix deduplicate instead of each spawning
@@ -170,6 +172,15 @@ type pendingEntry struct {
 	done chan struct{}
 }
 
+// requestStamp is the per-client pacing record: when the last request
+// completed and how many characters its upstream reply had — the next
+// request's wait grows with the reply length, the way a human reader's
+// would.
+type requestStamp struct {
+	at    time.Time
+	reply int
+}
+
 func New(cfg *config.Config, pool *AccountPool, convs *ConvStore) *Handler {
 	h := &Handler{
 		cfg:               cfg,
@@ -177,7 +188,7 @@ func New(cfg *config.Config, pool *AccountPool, convs *ConvStore) *Handler {
 		convs:             convs,
 		limiter:           NewAccountLimiter(cfg.AccountQPM),
 		stats:             NewRiskStats(len(pool.clients)),
-		lastRequestAt:     make(map[*deepseek.Client]time.Time),
+		lastRequestAt:     make(map[*deepseek.Client]requestStamp),
 		pending:           make(map[string]*pendingEntry),
 		prefixToClientIdx: make(map[string]int),
 		keyIDs:            make(map[string]string, len(cfg.ProxyKeys)),
@@ -321,18 +332,25 @@ func writeError(w http.ResponseWriter, status int, errType, msg string) {
 
 // writeUpstreamError records the outcome class of an upstream failure and
 // writes the OpenAI-style error response. 429/503 responses additionally
-// carry a Retry-After hint derived from the pool's longest active 429
-// cooldown, so well-behaved clients can back off instead of hammering the
+// carry a Retry-After hint — the pool's longest active 429 cooldown when
+// one is in flight, a flat 60s backoff when the whole pool is dead or over
+// quota — so well-behaved clients can back off instead of hammering the
 // proxy.
 func (h *Handler) writeUpstreamError(w http.ResponseWriter, err error) {
 	h.recordUpstreamError(err)
 	status, msg := mapUpstreamError(err)
 	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
+		secs := 0
 		if left := h.pool.MaxCoolingLeft(); left > 0 {
-			secs := int(left.Round(time.Second).Seconds())
+			secs = int(left.Round(time.Second).Seconds())
 			if secs < 1 {
 				secs = 1
 			}
+		}
+		if secs == 0 && (errors.Is(err, errNoLiveAccount) || errors.Is(err, errDailyLimit)) {
+			secs = 60
+		}
+		if secs > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(secs))
 		}
 	}
@@ -683,37 +701,7 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	// envelope form code 40003 "Authorization Failed (invalid token)")
 	// without ban wording are token problems.
 	if err != nil {
-		if idx := h.pool.IndexOf(conv.Client); idx >= 0 {
-			if kw := banKeyword(err); kw != "" {
-				reason := "upstream ban detected (" + kw + ")"
-				if h.pool.Quarantine(idx, reason) {
-					if h.cfg.BanQuarantineHours > 0 {
-						hold := time.Duration(h.cfg.BanQuarantineHours) * time.Hour
-						h.pool.SetBanUntil(idx, time.Now().Add(hold))
-						log.Printf("health: account #%d/%d %s → held for %s (BAN_QUARANTINE_HOURS=%d)", idx+1, len(h.pool.clients), reason, hold, h.cfg.BanQuarantineHours)
-					} else {
-						log.Printf("health: account #%d/%d %s → quarantined until a probe succeeds", idx+1, len(h.pool.clients), reason)
-					}
-				}
-				if h.health != nil {
-					h.health.EventQuarantine(idx, reason)
-				}
-			} else if deepseek.IsAuthFailure(err) {
-				var ae *deepseek.APIError
-				reason := "upstream auth failure (token invalid or expired)"
-				switch {
-				case errors.As(err, &ae) && (ae.HTTPStatus == 401 || ae.HTTPStatus == 403):
-					reason = fmt.Sprintf("upstream http %d during completion", ae.HTTPStatus)
-				case errors.As(err, &ae) && ae.Code != 0:
-					reason = fmt.Sprintf("upstream auth failure (code %d: %s)", ae.Code, ae.Msg)
-				}
-				if h.health != nil {
-					h.health.EventQuarantine(idx, reason)
-				} else {
-					h.pool.Quarantine(idx, reason)
-				}
-			}
-		}
+		h.quarantineOnUpstreamFailure(conv.Client, err, "during completion")
 	}
 
 	// Session self-heal (PERSIST_SESSIONS, non-streaming only): a cached or
@@ -772,8 +760,9 @@ func (h *Handler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Record this request time for the next cooldown calculation.
-	h.recordRequestTime(conv.Client)
+	// Record this request time and reply size for the next pacing
+	// calculation (read-time / tool-loop gap).
+	h.recordRequestTime(conv.Client, len(reply.String()))
 
 	// Non-streaming replies are parsed for marker blocks once complete; the
 	// streaming detector already flushed its residue at the end of the stream.
@@ -1216,6 +1205,10 @@ func (h *Handler) coalesceOrCreate(key, modelID string) (*Conversation, error) {
 		var conv *Conversation
 		if err != nil {
 			log.Printf("chat: session create failed: %v", err)
+			// A dead token must not wait for the next periodic probe:
+			// quarantine this account now so the conversation migrates off
+			// it immediately instead of being retried into it.
+			h.quarantineOnUpstreamFailure(client, err, "on session create")
 			err = context.Canceled
 		} else {
 			conv = &Conversation{
@@ -1338,6 +1331,60 @@ func banKeyword(err error) string {
 		}
 	}
 	return ""
+}
+
+// quarantineOnUpstreamFailure runs the passive detection every upstream
+// failure path must run: a BAN wording quarantines the account under the
+// BanQuarantineHours hold; an auth failure (HTTP 401/403, or the HTTP-200
+// envelope form code 40003 "Authorization Failed (invalid token)")
+// quarantines it until a probe succeeds.
+//
+// The session-create paths call this too — when a dead token is only
+// noticed by a periodic probe, the conversation keeps getting retried into
+// the dead account in the meantime (the 2026-11-07 incident: 11 session
+// creates in 3 minutes, each re-sending the full conversation).
+// `stage` ("during completion" / "on session create") is logged in the
+// HTTP-status reason text.
+func (h *Handler) quarantineOnUpstreamFailure(client *deepseek.Client, err error, stage string) {
+	if err == nil || client == nil {
+		return
+	}
+	idx := h.pool.IndexOf(client)
+	if idx < 0 {
+		return
+	}
+	if kw := banKeyword(err); kw != "" {
+		reason := "upstream ban detected (" + kw + ")"
+		if h.pool.Quarantine(idx, reason) {
+			if h.cfg.BanQuarantineHours > 0 {
+				hold := time.Duration(h.cfg.BanQuarantineHours) * time.Hour
+				h.pool.SetBanUntil(idx, time.Now().Add(hold))
+				log.Printf("health: account #%d/%d %s → held for %s (BAN_QUARANTINE_HOURS=%d)", idx+1, len(h.pool.clients), reason, hold, h.cfg.BanQuarantineHours)
+			} else {
+				log.Printf("health: account #%d/%d %s → quarantined until a probe succeeds", idx+1, len(h.pool.clients), reason)
+			}
+		}
+		if h.health != nil {
+			h.health.EventQuarantine(idx, reason)
+		}
+		return
+	}
+	if !deepseek.IsAuthFailure(err) {
+		return
+	}
+	var ae *deepseek.APIError
+	reason := "upstream auth failure (token invalid or expired)"
+	switch {
+	case errors.As(err, &ae) && (ae.HTTPStatus == 401 || ae.HTTPStatus == 403):
+		reason = fmt.Sprintf("upstream http %d %s", ae.HTTPStatus, stage)
+	case errors.As(err, &ae) && ae.Code != 0:
+		reason = fmt.Sprintf("upstream auth failure (code %d: %s)", ae.Code, ae.Msg)
+	}
+	if h.health != nil {
+		h.health.EventQuarantine(idx, reason)
+	} else {
+		h.pool.Quarantine(idx, reason)
+	}
 }
 
 func mapUpstreamError(err error) (int, string) {
@@ -1470,6 +1517,7 @@ func (h *Handler) doCompletionWithRetry(ctx context.Context, client *deepseek.Cl
 		}
 		sid, err := client.CreateSession(newCtx)
 		if err != nil {
+			h.quarantineOnUpstreamFailure(client, err, "on session create")
 			return err
 		}
 		input.SessionID = sid
@@ -1503,27 +1551,34 @@ func shouldPromoteReasoning(reply, thinking string, enabled, hasCalls bool) (boo
 	return false, ""
 }
 
-// recordRequestTime updates the last-request timestamp for this client
-// so the next request will enforce the read-time cooldown.
-func (h *Handler) recordRequestTime(client *deepseek.Client) {
+// recordRequestTime updates this client's pacing stamp (when the last
+// request completed and how long its upstream reply was) so the next
+// request can enforce the read-time / tool-loop pacing.
+func (h *Handler) recordRequestTime(client *deepseek.Client, replyChars int) {
 	h.mu.Lock()
-	h.lastRequestAt[client] = time.Now()
+	h.lastRequestAt[client] = requestStamp{at: time.Now(), reply: replyChars}
 	h.mu.Unlock()
 }
 
-// enforceReadTimeCooldown waits until enough time has passed since the last
-// request to this account, simulating a human reading the reply before
-// sending the next message. This creates a natural inter-request rhythm
-// on top of the QPM token bucket. Agent tool loops are machine-paced, so
-// their "reading" wait is capped to keep the loop responsive.
+// enforceReadTimeCooldown paces the next request to this account.
 //
-// LONG_PAUSE_CHANCE additionally rolls a dice per request: with that
-// probability the wait stretches into a 20–60s "stepped away from the
-// keyboard" pause — a long-tail human habit (checked the phone, read the
-// mail) that makes the request rhythm even less machine-like. Skipped for
-// agent tool loops, which must stay responsive.
+// Human-paced traffic waits RequestReadTimeMin ~ Max — a simulated human
+// reading the reply — plus an optional LONG_PAUSE_CHANCE 20–60s "stepped
+// away from the keyboard" pause (a long-tail human habit: checked the
+// phone, read the mail) that makes the rhythm even less machine-like.
+//
+// Agent tool loops are machine-paced; a flat cap between their turns reads
+// as automation. Instead the gap grows with the previous reply's length
+// (a human who got a long answer reads it before firing the next tool
+// call): TOOL_LOOP_MIN_GAP floor (default 8s, 0 disables tool-loop pacing)
+// plus 1s per 2000 reply chars, capped at 30s of "reading", with 0–50%
+// jitter on top.
 func (h *Handler) enforceReadTimeCooldown(client *deepseek.Client, toolLoop bool) {
-	if !toolLoop && h.cfg.LongPauseChance > 0 && rand2.Float64() < h.cfg.LongPauseChance {
+	if toolLoop {
+		h.enforceToolLoopGap(client)
+		return
+	}
+	if h.cfg.LongPauseChance > 0 && rand2.Float64() < h.cfg.LongPauseChance {
 		pause := time.Duration(rand2.Int63n(40*int64(time.Second))) + 20*time.Second // 20–60s
 		log.Printf("chat: human-like long pause before upstream request: %s", pause)
 		time.Sleep(pause)
@@ -1532,27 +1587,56 @@ func (h *Handler) enforceReadTimeCooldown(client *deepseek.Client, toolLoop bool
 		return
 	}
 	h.mu.Lock()
-	last := h.lastRequestAt[client]
+	stamp := h.lastRequestAt[client]
 	h.mu.Unlock()
+	h.enforcePacingGap(stamp, h.cfg.RequestReadTimeMin, h.cfg.RequestReadTimeMax)
+}
 
-	if !last.IsZero() {
-		minWait := h.cfg.RequestReadTimeMin
-		maxWait := h.cfg.RequestReadTimeMax
-		if toolLoop {
-			const toolLoopCap = 2 * time.Second
-			if minWait > toolLoopCap {
-				minWait = toolLoopCap
-			}
-			if maxWait > toolLoopCap {
-				maxWait = toolLoopCap
-			}
-		}
-		if maxWait > minWait {
-			minWait = time.Duration(rand2.Int63n(int64(maxWait-minWait))) + minWait
-		}
-		elapsed := time.Since(last)
-		if elapsed < minWait {
-			time.Sleep(minWait - elapsed)
-		}
+// enforceToolLoopGap paces agent tool-loop requests (see
+// enforceReadTimeCooldown).
+func (h *Handler) enforceToolLoopGap(client *deepseek.Client) {
+	if h.cfg.ToolLoopMinGap <= 0 {
+		return // tool-loop pacing explicitly disabled
+	}
+	h.mu.Lock()
+	stamp := h.lastRequestAt[client]
+	h.mu.Unlock()
+	if stamp.at.IsZero() {
+		return
+	}
+	gap := toolLoopGap(h.cfg, stamp.reply)
+	jitter := gap / 2
+	if jitter > 4*time.Second {
+		jitter = 4 * time.Second
+	}
+	h.enforcePacingGap(stamp, gap, gap+jitter)
+}
+
+// toolLoopGap is the minimum wait before the next tool-loop request: the
+// TOOL_LOOP_MIN_GAP floor, scaled up by the previous reply's length
+// (1s per 2000 chars, capped at 30s of "reading").
+func toolLoopGap(cfg *config.Config, replyChars int) time.Duration {
+	read := time.Duration(replyChars/2000) * time.Second
+	if read > 30*time.Second {
+		read = 30 * time.Second
+	}
+	if read > cfg.ToolLoopMinGap {
+		return read
+	}
+	return cfg.ToolLoopMinGap
+}
+
+// enforcePacingGap sleeps until at least [minWait, maxWait] has elapsed
+// since the client's last request (a random point in the range).
+func (h *Handler) enforcePacingGap(stamp requestStamp, minWait, maxWait time.Duration) {
+	if stamp.at.IsZero() {
+		return
+	}
+	if maxWait > minWait {
+		minWait = time.Duration(rand2.Int63n(int64(maxWait-minWait))) + minWait
+	}
+	elapsed := time.Since(stamp.at)
+	if elapsed < minWait {
+		time.Sleep(minWait - elapsed)
 	}
 }

@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### 工具循环拟人节奏 / 死号即隔离（2026-11-07 事故修复批次）
+
+- **⚠️ 工具循环节奏改为随回复长度增长（默认行为变更）**（`TOOL_LOOP_MIN_GAP`，`handlers/handler.go` + `config/config.go`）：此前 agent 工具循环在同账号上被封顶为固定 2s 间隔——秒级连发是风控眼中的机器特征。现在间隔下限为 `TOOL_LOOP_MIN_GAP`（默认 `8s`，`0` = 关闭工具循环限速），并叠加"阅读时间"（上一条回复每 2000 字 +1s，封顶 30s），再加 0–50%（≤4s）抖动避免恒定节奏。`lastRequestAt` 升级为记录时间戳 + 回复字数；人类节奏路径（5~30s 阅读冷却、`LONG_PAUSE_CHANCE` 长停顿）不变。
+- **建会话失败立即隔离账号**（`handlers/handler.go`）：此前建会话撞 40003 / 封禁措辞只打日志、返回 `context.Canceled`，账号要等下一个 30 分钟周期探测才被隔离——期间客户端每次重试都在死账号上重建会话（11/07 事故：3 分钟内 11 连发，每次重发整段 24 条消息的会话）。现在 completion / coalesce 建会话 / 内联建会话三条路径统一走 `quarantineOnUpstreamFailure`：封禁措辞 → 按 `BAN_QUARANTINE_HOURS` 保持隔离；40003/401/403 → 立即隔离直到探测成功，会话马上迁到活账号。
+- **池全死 / 日配额耗尽的 503 附带 `Retry-After: 60`**（`handlers/handler.go`）：无 429 冷却进行中时，`errNoLiveAccount` / `errDailyLimit` 的 503 现在带 60s 退避提示，客户端不再秒级重发同一份完整会话（原有基于 429 冷却的 `Retry-After` 行为不变）。
+- **`TOOL_LOOP_MIN_GAP` env**（默认 `8s`；双 README + `.env.example` + `.env.risk-hardened.example`（10s）+ 启动 banner 已文档化）。
+
 ### 新会话播种 / 429 槽位 / 可观测细粒度 / 流式工具索引（参考 webai2api 批次）
 
 - **⚠️ 新会话播种不再全量重放（默认行为变更）**（`SESSION_REPLAY_TURNS`，`handlers/handler.go` + `handlers/conversations.go` + `config/config.go`）：此前 agent 工具流开新会话（会话重置 / 配额轮换 / 死会话重建）时，会把客户端**全部**历史消息重放进提示词——这是本代理最明显的机器特征之一。现在只播种**最近 N 个完整轮组**（user 指令 + 其产生的 assistant/tool 交换），且只在 user 消息边界切，绝不断开工具链。新 env `SESSION_REPLAY_TURNS`：`2` = 默认（保留最近 2 轮，换会话后前情基本不丢）；`0` = 只发当前指令（痕迹最薄，适合短问答）；`all` = 全量重放（旧版行为，需回退时用它）。每个新会话播种会打日志 `chat: fresh session seeded with X of Y messages (SESSION_REPLAY_TURNS=N)`，启动 banner 一行显示当前策略。**普通聊天路径不受影响**（本来就只发最后一条 user 消息）。升级后若感觉长任务换会话"忘前情"，把值调大即可；`all` 可完整恢复旧行为。

@@ -52,6 +52,7 @@ type Config struct {
 	PersistSessions         bool          // persist the conversation index to a local data file so tasks survive a restart (default false)
 	DataDir                 string        // data folder for persisted state; default <LOG_FILE dir>/../data, else ./data
 	SessionReplayTurns      int           // fresh-session seeding for tool flows: number of complete turn groups to replay ahead of the current instruction (default 2; 0 = instruction only; -1 = all, the legacy full replay)
+	ToolLoopMinGap          time.Duration // floor for the inter-request gap of agent tool loops on the same account; grows with the previous reply's length (default 8s; 0 = tool-loop pacing off)
 }
 
 // Load reads configuration from the environment. Accounts come from
@@ -101,6 +102,7 @@ func Load() (*Config, error) {
 		ConvFingerprintRoute:    parseBoolEnv("CONV_FINGERPRINT_ROUTE", false),
 		PersistSessions:         parseBoolEnv("PERSIST_SESSIONS", false),
 		SessionReplayTurns:      parseReplayTurnsEnv("SESSION_REPLAY_TURNS", 2),
+		ToolLoopMinGap:          parseDurationEnv("TOOL_LOOP_MIN_GAP", 8*time.Second),
 	}
 	// Proxy API keys: PROXY_API_KEY (optional) plus one-per-line entries in
 	// PROXY_KEYS_FILE. When PROXY_API_KEY is empty the file is the source of

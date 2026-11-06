@@ -141,6 +141,7 @@ func main() {
 		}())
 		log.Printf("  device fingerprints      : stable per account (persisted: %s, %d new this start)", fingerprintPath, newFingerprints)
 		log.Printf("  request read time        : %s ~ %s", cfg.RequestReadTimeMin, cfg.RequestReadTimeMax)
+		log.Printf("  tool loop min gap      : %s (agent tool-loop turns grow with reply length; 0 = no pacing)", cfg.ToolLoopMinGap)
 		log.Printf("  session reset chance     : %.0f%%", cfg.SessionResetChance*100)
 		switch {
 		case cfg.SessionReplayTurns < 0:

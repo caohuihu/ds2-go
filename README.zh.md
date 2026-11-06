@@ -166,6 +166,7 @@ docker compose -f docker-compose-ghcr.yml up
 | `DEVICE_ID_ROTATE_HOURS` | `0` | 设备 ID 定期轮换间隔（小时，0=不轮换；轮换值不落盘，重启回落固定指纹） |
 | `REQUEST_READ_TIME_MIN` | `5s` | 同一账号两次请求之间的最小等待（模拟阅读回复） |
 | `REQUEST_READ_TIME_MAX` | `30s` | 同一账号两次请求之间的最大等待 |
+| `TOOL_LOOP_MIN_GAP` | `8s` | Agent 工具循环两次请求的最小间隔下限（并随上一条回复长度加长：每 2000 字 +1s，封顶 30s）；`0`=不限制工具循环节奏 |
 | `SESSION_RESET_CHANCE` | `0.15` | 每次请求有 X% 概率开新会话（同时影响 Strategy 2 和 Strategy 3，控制连续问答的"断句"频率） |
 | `REQUESTS_PER_SESSION` | `0` | 每会话最大请求数，到达后强制开新会话（0=关闭，与 `SESSION_RESET_CHANCE` 配合使用） |
 | `SESSION_REPLAY_TURNS` | `2` | 开新会话时的"播种"轮数（仅 agent 工具流）：当前指令前重放多少个完整轮组（user 指令+其 assistant/tool 交换）。`2`=默认（最近 2 轮）；`0`=只发当前指令（痕迹最薄）；`all`=全量历史（旧版行为）。普通聊天不受影响 |

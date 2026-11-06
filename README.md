@@ -172,6 +172,7 @@ docker compose -f docker-compose-ghcr.yml up
 | `DEVICE_ID_ROTATE_HOURS` | `0` | Device-ID rotation interval in hours (0 = no rotation) |
 | `REQUEST_READ_TIME_MIN` | `5s` | Min wait between two requests to the same account (simulates reading the reply) |
 | `REQUEST_READ_TIME_MAX` | `30s` | Max wait between two requests to the same account |
+| `TOOL_LOOP_MIN_GAP` | `8s` | Floor for the inter-request gap of agent tool loops on the same account; the gap grows with the previous reply's length (1s per 2000 chars, capped at 30s). `0` disables tool-loop pacing |
 | `SESSION_RESET_CHANCE` | `0.15` | Per-request probability (X%) of opening a new session; affects both Strategy 2 and Strategy 3, controlling how often a task is "cut" into a new conversation |
 | `REQUESTS_PER_SESSION` | `0` | Max requests per session; a new session is forced after this (0 = off, use together with `SESSION_RESET_CHANCE`) |
 | `SESSION_REPLAY_TURNS` | `2` | Seeding turns when a new session opens: in agent tool flows, how many complete turn groups (user instruction + its assistant/tool exchange) are replayed before the current instruction. `2` = default (last 2 turns); `0` = current instruction only (thinnest trace); `all` = full history (legacy). Plain chat is unaffected |
