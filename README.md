@@ -43,6 +43,7 @@ official OpenAI SDKs, `curl` — and talk to DeepSeek without an official API ke
 
 - **OpenAI Chat Completions compatible** — `POST /v1/chat/completions`, streaming and non-streaming.
 - **Model listing** — `GET /v1/models`.
+- **Health endpoint** — `GET /health` (no auth) returns `200 {"status":"ok"}` for container / uptime checks.
 - **Image input** — `image_url` content blocks accept base64 data URLs and http(s) links; images are uploaded to DeepSeek and sent as `ref_file_ids`.
 - **Automatic proof-of-work** — the server solves the web client's DeepSeekHashV1 challenge (a 23-round Keccak variant) in parallel, typically under 100 ms.
 - **Reasoning support** — thinking output is mapped to `reasoning_content`, matching the official DeepSeek API.
@@ -91,8 +92,10 @@ Single account:
 PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' PORT=8080 ./deepseek2api
 ```
 
-Multiple accounts: create `accounts.txt` in the working directory, one token per
-line (blank lines and `#` comments are ignored):
+Multiple accounts: fill in the `accounts.txt` file in the working directory,
+one token per line (blank lines and `#` comments are ignored). The repo ships
+an empty placeholder `accounts.txt` on purpose — it reminds you where the
+token file goes; keep the committed copy empty and never commit real tokens:
 
 ```text
 eyJhbGciOi...token1
@@ -133,6 +136,14 @@ Or with Compose:
 PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --build
 ```
 
+Or pull the prebuilt multi-arch image that CI (`.github/workflows/docker.yml`)
+pushes to GHCR — `docker-compose-ghcr.yml` points at `ghcr.io/caohuihu/ds2-go:latest`,
+no local build needed:
+
+```bash
+docker compose -f docker-compose-ghcr.yml up
+```
+
 > **Risk-hardened preset**: for long-running, multi-account deployments, copy `.env.risk-hardened.example` to `.env` — three layers of fraud protection (human-like behavior / per-account quota + breaker / task binding with zero replay) plus a 30m risk log; values and rationale are commented in the file.
 
 ## Configuration
@@ -146,11 +157,11 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | `DEEPSEEK_ACCOUNTS_FILE` | `accounts.txt` | Multi-account file, one token per line |
 | `DEEPSEEK_BASE_URL` | `https://chat.deepseek.com` | Upstream base URL |
 | `DEFAULT_MODEL` | `deepseek-chat` | Model used when a request omits one |
-| `CONVERSATION_TTL` | — | 旧版单值（兼容），现已弃用，请使用 `CONVERSATION_TTL_OPTIONS` |
-| `CONVERSATION_TTL_OPTIONS` | `10m,60m,2h,5h,0` | 会话 TTL 随机池，逗号分隔；`0` 表示永不删除。每次新建会话随机选取一个，让清理时间不可预测 |
+| `CONVERSATION_TTL` | — | Legacy single-value form, deprecated — use `CONVERSATION_TTL_OPTIONS` |
+| `CONVERSATION_TTL_OPTIONS` | `10m,60m,2h,5h,0` | Random session-TTL pool, comma-separated; `0` = never delete. Each new session picks one at random, making cleanup timing unpredictable |
 | `MAX_CONVERSATIONS` | `1024` | Max sessions kept in memory (LRU eviction) |
-| `ACCOUNT_QPM` | `6` | 每账号每秒滑动窗口内最大请求数（正常人约 1-6 QPM，10-60s/条） |
-| `MAX_CONCURRENT_PER_ACCOUNT` | `5` | 每账号同时进行的最大并发请求数（= 同时运行的网页会话数上限） |
+| `ACCOUNT_QPM` | `6` | Max requests per account within a sliding one-minute window (a normal human runs about 1–6 QPM, one every 10–60 s) |
+| `MAX_CONCURRENT_PER_ACCOUNT` | `5` | Max in-flight concurrent requests per account (= cap on simultaneously open web sessions) |
 | `RETRY_MAX_ATTEMPTS` | `3` | Max 429 retry attempts before giving up |
 | `RETRY_BASE_DELAY` | `2s` | Base delay for exponential backoff (actual waits: 2s, 4s, 8s…) |
 | `REQUEST_JITTER_MIN` | `200ms` | Min random delay (ms) before each completion request |
@@ -158,17 +169,17 @@ PROXY_API_KEY='your-proxy-key' DEEPSEEK_TOKEN='your-token' docker compose up --b
 | `POW_JITTER_MIN` | `30ms` | Min artificial delay (ms) when solving POW challenge |
 | `POW_JITTER_MAX` | `150ms` | Max artificial delay (ms) when solving POW challenge |
 | `SESSION_CREATE_JITTER` | `200ms` | Random delay before creating a new DeepSeek session |
-| `DEVICE_ID_ROTATE_HOURS` | `0` | Device ID 定期轮换间隔（小时，0=不轮换） |
-| `REQUEST_READ_TIME_MIN` | `5s` | 同一账号两次请求之间的最小等待（秒），模拟阅读回复 |
-| `REQUEST_READ_TIME_MAX` | `30s` | 同一账号两次请求之间的最大等待（秒） |
-| `SESSION_RESET_CHANCE` | `0.15` | 每次请求有 X% 概率开新会话（同时影响 Strategy 2 和 Strategy 3，控制连续问答的"断句"频率） |
-| `REQUESTS_PER_SESSION` | `0` | 每个会话最大请求数，到达后强制创建新会话（0=关闭，与 SESSION_RESET_CHANCE 配合使用） |
-| `SESSION_REPLAY_TURNS` | `2` | 开新会话（换会话）时的"播种"轮数：agent 工具流下，当前指令前重放多少个完整轮组（user 指令+其 assistant/tool 交换）。`2`=默认（最近 2 轮）；`0`=只发当前指令（痕迹最薄）；`all`=全量历史（旧版行为）。普通聊天不受影响 |
-| `LOG_FILE` | `/app/logs/app.log` | 日志文件路径，留空只输出到 stdout；设置后日志同时写入文件 |
-| `STARTUP_ACCOUNT_CHECK` | `true` | 启动时对全部账号做一次轻量鉴权探测，失效账号自动隔离 |
-| `HEALTH_PROBE_INTERVAL` | `30m` | 周期探测所有存活账号的间隔（0=关闭） |
-| `HEALTH_PROBE_DEAD_RETRY` | `10m` | 对被隔离账号的重试间隔（token 换新后自动复活） |
-| `HEALTH_LOG_FILE` | 同 `LOG_FILE` 目录 | 检测日志文件：隔离/复活/摘要事件，token 只显示掩码；留空默认与主日志同目录（如 `/app/logs/deepseek-health.log`） |
+| `DEVICE_ID_ROTATE_HOURS` | `0` | Device-ID rotation interval in hours (0 = no rotation) |
+| `REQUEST_READ_TIME_MIN` | `5s` | Min wait between two requests to the same account (simulates reading the reply) |
+| `REQUEST_READ_TIME_MAX` | `30s` | Max wait between two requests to the same account |
+| `SESSION_RESET_CHANCE` | `0.15` | Per-request probability (X%) of opening a new session; affects both Strategy 2 and Strategy 3, controlling how often a task is "cut" into a new conversation |
+| `REQUESTS_PER_SESSION` | `0` | Max requests per session; a new session is forced after this (0 = off, use together with `SESSION_RESET_CHANCE`) |
+| `SESSION_REPLAY_TURNS` | `2` | Seeding turns when a new session opens: in agent tool flows, how many complete turn groups (user instruction + its assistant/tool exchange) are replayed before the current instruction. `2` = default (last 2 turns); `0` = current instruction only (thinnest trace); `all` = full history (legacy). Plain chat is unaffected |
+| `LOG_FILE` | empty | Log file path; empty = stdout only. When set, logs go to both the file and stdout |
+| `STARTUP_ACCOUNT_CHECK` | `true` | Lightweight auth probe of all accounts at startup; expired accounts are quarantined automatically |
+| `HEALTH_PROBE_INTERVAL` | `30m` | Interval for probing all live accounts (0 = off) |
+| `HEALTH_PROBE_DEAD_RETRY` | `10m` | Retry interval for quarantined accounts (revives automatically once the token is refreshed) |
+| `HEALTH_LOG_FILE` | next to `LOG_FILE` | Detection log file: quarantine / revival / summary events; tokens shown masked only. Empty = same folder as the main log (e.g. `/app/logs/deepseek-health.log`) |
 | `BAN_QUARANTINE_HOURS` | `168` | Hold window for a BAN-detected account (0 = hold until a probe succeeds). 429 account-level backoff is built in, needs no config |
 | `DAILY_REQUEST_LIMIT` | `0` | Per-account daily request budget (resets by local date, counters persisted across restarts); 0 = unlimited. When every account is spent, new sessions 503 until midnight; cached sessions are unaffected |
 | `LONG_PAUSE_CHANCE` | `0` | Per-request probability of an extra 20–60s human-like pause (agent tool loops are exempt); 0 = off |
@@ -379,7 +390,7 @@ Authorization: Bearer <PROXY_API_KEY>
 ```
 
 `DEEPSEEK_TOKEN` / `accounts.txt` are used server-side only and are never
-exposed to callers.
+exposed to callers. `GET /health` is the only endpoint that needs no key.
 
 ## Notes & limits
 
@@ -392,7 +403,9 @@ exposed to callers.
   thinking block (empty body), the thinking text is promoted to `content` so
   the client never gets a blank reply (`REASONING_FALLBACK`, default on).
 - Upstream `429` maps to `429`; an invalid token maps to `401`.
-- Do **not** commit your tokens. `accounts.txt` is already in `.gitignore`.
+- Do **not** commit your tokens. The repo intentionally keeps an empty
+  `accounts.txt` placeholder as a reminder of where the token file goes:
+  fill it in your local working copy, keep the committed copy empty.
 
 ## Project layout
 

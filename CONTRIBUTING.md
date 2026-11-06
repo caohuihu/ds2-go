@@ -23,8 +23,11 @@ go vet ./...
 go test ./...
 ```
 
-There is no CI: run the three commands above locally before opening a PR. A
-change that does not build, vet clean and pass tests will not be merged.
+CI (`.github/workflows/docker.yml`) runs `go build`, `go vet` and `go test` on
+every pull request, and builds/pushes the multi-arch Docker image to GHCR on
+pushes to `main` and `v*` tags. Run the same three commands locally before
+opening a PR — a change that does not build, vet clean and pass tests will
+not be merged.
 
 ## Style
 

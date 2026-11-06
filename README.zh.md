@@ -42,6 +42,7 @@ OpenAI SDK、`curl` —— 即可在没有官方 API Key 的情况下使用 Deep
 
 - **OpenAI Chat Completions 兼容** —— `POST /v1/chat/completions`，支持流式与非流式。
 - **模型列表** —— `GET /v1/models`。
+- **健康端点** —— `GET /health`（免鉴权）返回 `200 {"status":"ok"}`，供容器/存活检查使用。
 - **图片输入** —— `image_url` 内容块支持 base64 data URL 与 http(s) 链接，自动上传为 DeepSeek 文件并以 `ref_file_ids` 发送。
 - **服务端自动完成 proof-of-work** —— 并行求解 DeepSeekHashV1（23 轮 Keccak 变体），通常 <100ms。
 - **推理支持** —— 思考过程映射为 `reasoning_content`，与官方 API 一致。
@@ -87,7 +88,9 @@ go build -o deepseek2api .
 PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' PORT=8080 ./deepseek2api
 ```
 
-多账号：在工作目录创建 `accounts.txt`，每行一个 token（`#` 与空行忽略）：
+多账号：填写工作目录中的 `accounts.txt`，每行一个 token（`#` 与空行忽略）。
+仓库有意保留一个**空的** `accounts.txt` 占位文件作为提醒——它在本地填写，
+提交版本保持为空，切勿把真实 token 提交进 git：
 
 ```text
 eyJhbGciOi...token1
@@ -128,6 +131,13 @@ docker run --rm -p 8080:8080 \
 PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' docker compose up --build
 ```
 
+或拉取 CI（`.github/workflows/docker.yml`）推送到 GHCR 的预构建多架构镜像
+（`docker-compose-ghcr.yml` 指向 `ghcr.io/caohuihu/ds2-go:latest`，免本地构建）：
+
+```bash
+docker compose -f docker-compose-ghcr.yml up
+```
+
 > **抗风控预设**：长期挂机 / 多账号部署可直接把 `.env.risk-hardened.example` 复制为 `.env` —— 三层防护（行为拟人 / 账号配额+熔断 / 任务绑定+零重放）+ 30m 风控日志，各取值与理由见文件内注释。
 
 ## 配置项
@@ -141,8 +151,25 @@ PROXY_API_KEY='你的代理密钥' DEEPSEEK_TOKEN='你的token' docker compose u
 | `DEEPSEEK_ACCOUNTS_FILE` | `accounts.txt` | 多账号文件，每行一个 token |
 | `DEEPSEEK_BASE_URL` | `https://chat.deepseek.com` | 上游地址 |
 | `DEFAULT_MODEL` | `deepseek-chat` | 请求未指定模型时使用 |
-| `CONVERSATION_TTL` | `30m` | 会话空闲多久后从上游删除 |
+| `CONVERSATION_TTL` | — | 旧版单值（兼容），现已弃用，请使用 `CONVERSATION_TTL_OPTIONS` |
+| `CONVERSATION_TTL_OPTIONS` | `10m,60m,2h,5h,0` | 会话 TTL 随机池，逗号分隔；`0` = 永不删除。每次新建会话随机取一个，让清理时间不可预测 |
 | `MAX_CONVERSATIONS` | `1024` | 内存中保留的最大会话数（LRU 淘汰） |
+| `ACCOUNT_QPM` | `6` | 每账号每分钟滑动窗口内最大请求数（拟人建议 1–6 QPM，即 10–60s/条） |
+| `MAX_CONCURRENT_PER_ACCOUNT` | `5` | 每账号同时进行的最大并发请求数（= 同时运行的网页会话数上限） |
+| `RETRY_MAX_ATTEMPTS` | `3` | 429 最大重试次数（重试耗尽才向客户端上抛 429） |
+| `RETRY_BASE_DELAY` | `2s` | 429 指数退避基数（实际等待 2s、4s、8s…） |
+| `REQUEST_JITTER_MIN` | `200ms` | 每次补全请求前最小随机等待（模拟网络/操作抖动） |
+| `REQUEST_JITTER_MAX` | `800ms` | 每次补全请求前最大随机等待 |
+| `POW_JITTER_MIN` | `30ms` | 求解 POW 挑战时的最小人工延迟 |
+| `POW_JITTER_MAX` | `150ms` | 求解 POW 挑战时的最大人工延迟 |
+| `SESSION_CREATE_JITTER` | `200ms` | 新建 DeepSeek 会话前的随机等待（避免机械式秒建会话） |
+| `DEVICE_ID_ROTATE_HOURS` | `0` | 设备 ID 定期轮换间隔（小时，0=不轮换；轮换值不落盘，重启回落固定指纹） |
+| `REQUEST_READ_TIME_MIN` | `5s` | 同一账号两次请求之间的最小等待（模拟阅读回复） |
+| `REQUEST_READ_TIME_MAX` | `30s` | 同一账号两次请求之间的最大等待 |
+| `SESSION_RESET_CHANCE` | `0.15` | 每次请求有 X% 概率开新会话（同时影响 Strategy 2 和 Strategy 3，控制连续问答的"断句"频率） |
+| `REQUESTS_PER_SESSION` | `0` | 每会话最大请求数，到达后强制开新会话（0=关闭，与 `SESSION_RESET_CHANCE` 配合使用） |
+| `SESSION_REPLAY_TURNS` | `2` | 开新会话时的"播种"轮数（仅 agent 工具流）：当前指令前重放多少个完整轮组（user 指令+其 assistant/tool 交换）。`2`=默认（最近 2 轮）；`0`=只发当前指令（痕迹最薄）；`all`=全量历史（旧版行为）。普通聊天不受影响 |
+| `LOG_FILE` | 空 | 日志文件路径，留空只输出到 stdout；设置后日志同时写入文件 |
 | `STARTUP_ACCOUNT_CHECK` | `true` | 启动时对全部账号做一次轻量鉴权探测，失效账号自动隔离 |
 | `HEALTH_PROBE_INTERVAL` | `30m` | 周期探测所有存活账号的间隔（0=关闭） |
 | `HEALTH_PROBE_DEAD_RETRY` | `10m` | 对被隔离账号的重试间隔（token 换新后自动复活） |
@@ -219,13 +246,14 @@ Authorization: Bearer <PROXY_API_KEY>
 ```
 
 `DEEPSEEK_TOKEN` / `accounts.txt` 只在服务端使用，不会暴露给调用方。
+`GET /health` 是唯一免鉴权端点（容器/存活检查用）。
 
 ## 注意事项
 
 - **图片**：每张 ≤20MB，单次最多 8 张，支持 png/jpg/webp/gif/bmp；仅处理最后一条用户消息中的图片。
 - **`usage` 是估算值**：总量来自上游会话累计 token 的轮间差，分项按字符数近似。
 - 上游 `429` 原样映射为 `429`；令牌失效映射为 `401`。
-- 请勿将 token 提交到公开仓库（`accounts.txt` 已在 `.gitignore` 中）。
+- 请勿将 token 提交进 git。仓库有意保留一个**空的** `accounts.txt` 占位文件作为提醒——在本地填写，提交版本保持为空。
 
 ## 项目结构
 
